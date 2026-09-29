@@ -34,8 +34,10 @@ final class WindowManager {
     private var overlay: BoundaryOverlay?
     private var preview: SnapPreviewPanel?
     private var layoutWidget: LayoutPreviewPanel?
+    private var zoomPalette: ZoomPalettePanel?
     private var cursorIsResizing = false
     private var activeSnapZone: SnapZone?
+    private var lastZoomCheck = Date.distantPast
     private var pendingSnap = false
 
     func start() {
@@ -116,6 +118,13 @@ final class WindowManager {
     private func reconcileAndShowBoundary() {
         slots = slots.filter { windowExists($0.windowID) }
         syncLinkedResize()
+        if pendingSnap && boundaryDrag == nil {
+            updatePreview(at: NSEvent.mouseLocation)
+        }
+        if Date().timeIntervalSince(lastZoomCheck) >= 0.08 {
+            lastZoomCheck = Date()
+            updateZoomPalette()
+        }
         guard boundaryDrag == nil else { return }
         let mouse = NSEvent.mouseLocation
         var nearestX: CGFloat?
@@ -290,6 +299,45 @@ final class WindowManager {
         }
         if preview == nil { preview = SnapPreviewPanel() }
         preview?.show(frame: target)
+    }
+
+    private func updateZoomPalette() {
+        guard !pendingSnap, boundaryDrag == nil else {
+            zoomPalette?.close(); zoomPalette = nil
+            return
+        }
+        let mouse = NSEvent.mouseLocation
+        if let palette = zoomPalette, palette.frame.insetBy(dx: -8, dy: -8).contains(mouse) { return }
+        guard let window = focusedWindow(), let buttonFrame = zoomButtonFrame(of: window.element),
+              buttonFrame.insetBy(dx: -6, dy: -6).contains(mouse),
+              let screen = screen(containing: mouse) else {
+            zoomPalette?.close(); zoomPalette = nil
+            return
+        }
+        elements[window.id] = window.element
+        if zoomPalette == nil {
+            zoomPalette = ZoomPalettePanel { [weak self] start, end in
+                self?.applyPaletteLayout(to: window, start: start, end: end, screen: screen)
+            }
+        }
+        zoomPalette?.show(below: buttonFrame, on: screen)
+    }
+
+    private func zoomButtonFrame(of window: AXUIElement) -> CGRect? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(window, kAXZoomButtonAttribute as CFString, &value) == .success,
+              let value, let frame = axFrame(of: value as! AXUIElement) else { return nil }
+        let displayHeight = NSScreen.screens.first?.frame.maxY ?? 0
+        return CGRect(x: frame.minX, y: displayHeight - frame.maxY, width: frame.width, height: frame.height)
+    }
+
+    private func applyPaletteLayout(to window: (id: CGWindowID, element: AXUIElement), start: Int, end: Int, screen: NSScreen) {
+        elements[window.id] = window.element
+        slots.removeAll { $0.windowID == window.id || ($0.screenID == screen && $0.start < end && $0.end > start) }
+        slots.append(Slot(windowID: window.id, start: start, end: end, screenID: screen))
+        applyLayout(on: screen)
+        zoomPalette?.close(); zoomPalette = nil
+        NSHapticFeedbackManager.defaultPerformer.perform(.alignment, performanceTime: .now)
     }
 
     private func focusedWindow() -> (id: CGWindowID, element: AXUIElement)? {
@@ -513,6 +561,92 @@ final class LayoutPreviewView: NSView {
             path.lineWidth = 2
             NSColor.controlAccentColor.setStroke()
             path.stroke()
+        }
+    }
+}
+
+final class ZoomPalettePanel: NSPanel {
+    init(selection: @escaping (Int, Int) -> Void) {
+        super.init(contentRect: NSRect(x: 0, y: 0, width: 198, height: 126),
+                   styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        isFloatingPanel = true
+        level = .screenSaver
+        isOpaque = false
+        backgroundColor = .clear
+        hasShadow = true
+        collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        contentView = ZoomPaletteView(selection: selection)
+    }
+
+    override var canBecomeKey: Bool { false }
+
+    func show(below button: CGRect, on screen: NSScreen) {
+        let x = min(screen.visibleFrame.maxX - frame.width - 8,
+                    max(screen.visibleFrame.minX + 8, button.midX - frame.width / 2))
+        let y = max(screen.visibleFrame.minY + 8, button.minY - frame.height - 6)
+        setFrameOrigin(NSPoint(x: x, y: y))
+        orderFrontRegardless()
+    }
+}
+
+final class ZoomPaletteView: NSView {
+    private let selection: (Int, Int) -> Void
+    private let layouts = [(0, 3), (0, 6), (3, 6), (0, 2), (2, 4), (4, 6)]
+
+    init(selection: @escaping (Int, Int) -> Void) {
+        self.selection = selection
+        super.init(frame: .zero)
+    }
+
+    required init?(coder: NSCoder) { nil }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func mouseDown(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        guard let index = layoutIndex(at: point) else { return }
+        let layout = layouts[index]
+        selection(layout.0, layout.1)
+    }
+
+    private func layoutIndex(at point: CGPoint) -> Int? {
+        let grid = NSRect(x: 9, y: 9, width: bounds.width - 18, height: bounds.height - 34)
+        guard grid.contains(point) else { return nil }
+        let column = min(2, max(0, Int((point.x - grid.minX) / (grid.width / 3))))
+        let row = point.y >= grid.midY ? 0 : 1
+        return row * 3 + column
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let background = NSBezierPath(roundedRect: bounds, xRadius: 12, yRadius: 12)
+        NSColor.windowBackgroundColor.withAlphaComponent(0.97).setFill()
+        background.fill()
+        NSString(string: "Tile window").draw(at: NSPoint(x: 10, y: bounds.height - 21), withAttributes: [
+            .foregroundColor: NSColor.labelColor,
+            .font: NSFont.systemFont(ofSize: 11, weight: .semibold)
+        ])
+
+        let grid = NSRect(x: 9, y: 9, width: bounds.width - 18, height: bounds.height - 34)
+        let cellWidth = grid.width / 3
+        let cellHeight = grid.height / 2
+        for index in layouts.indices {
+            let column = index % 3
+            let row = index / 3
+            let cell = NSRect(x: grid.minX + CGFloat(column) * cellWidth + 3,
+                              y: grid.minY + CGFloat(1 - row) * cellHeight + 3,
+                              width: cellWidth - 6, height: cellHeight - 6)
+            NSColor.separatorColor.withAlphaComponent(0.18).setFill()
+            NSBezierPath(roundedRect: cell, xRadius: 6, yRadius: 6).fill()
+
+            let screen = cell.insetBy(dx: 9, dy: 8)
+            let layout = layouts[index]
+            let selected = NSRect(x: screen.minX + screen.width * CGFloat(layout.0) / 6,
+                                  y: screen.minY,
+                                  width: screen.width * CGFloat(layout.1 - layout.0) / 6,
+                                  height: screen.height)
+            NSColor.controlAccentColor.withAlphaComponent(0.75).setFill()
+            NSBezierPath(roundedRect: selected, xRadius: 2, yRadius: 2).fill()
+            NSColor.tertiaryLabelColor.setStroke()
+            NSBezierPath(roundedRect: screen, xRadius: 2, yRadius: 2).stroke()
         }
     }
 }

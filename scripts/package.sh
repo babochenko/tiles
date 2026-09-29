@@ -18,6 +18,10 @@ swiftc -O \
     -o "$APP/Contents/MacOS/Tiles"
 
 cp "$ROOT/Resources/Info.plist" "$APP/Contents/Info.plist"
+ICONSET="$DIST/AppIcon.iconset"
+swift "$ROOT/scripts/generate-icon.swift" "$ICONSET"
+iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
+rm -rf "$ICONSET"
 codesign --force --deep --sign - "$APP"
 ln -s /Applications "$STAGING/Applications"
 
