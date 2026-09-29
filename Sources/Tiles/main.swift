@@ -38,6 +38,7 @@ final class WindowManager {
     private var lastZoomCheck = Date.distantPast
     private var lastSlotCleanup = Date.distantPast
     private var pendingSnap = false
+    private var snapDragGesture = SnapDragGesture()
 
     func start() {
         requestAccessibility()
@@ -190,14 +191,17 @@ final class WindowManager {
             overlay?.close()
             preview?.close()
             pendingSnap = false
+            snapDragGesture.reset()
         } else {
             pendingSnap = true
+            snapDragGesture.mouseDown(at: point)
             draggedWindow = focusedWindow()
         }
     }
 
     fileprivate func mouseDragged(at point: CGPoint) {
         guard let drag = boundaryDrag else {
+            guard snapDragGesture.mouseDragged(to: point) else { return }
             // On mouse-down the clicked application may not yet have become
             // frontmost. Resolve it again once the system starts the drag.
             draggedWindow = focusedWindow() ?? draggedWindow
@@ -215,7 +219,8 @@ final class WindowManager {
         layoutWidget?.close()
         layoutWidget = nil
         activeSnapZone = nil
-        if pendingSnap {
+        let shouldSnap = snapDragGesture.mouseUp()
+        if pendingSnap && shouldSnap {
             if let screen = screen(containing: point), TilingGeometry.snapZone(at: point, in: screen.frame) != nil {
                 if let window = draggedWindow ?? focusedWindow() {
                     snap(window: window, at: point)

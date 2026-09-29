@@ -13,11 +13,12 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 CORE_BUILD="$DIST/TilesCore"
 mkdir -p "$CORE_BUILD"
 swiftc -O \
+    -whole-module-optimization \
     -parse-as-library \
     -emit-object \
     -emit-module \
     -module-name TilesCore \
-    "$ROOT/Sources/TilesCore/TilingGeometry.swift" \
+    "$ROOT/Sources/TilesCore/"*.swift \
     -o "$CORE_BUILD/TilesCore.o" \
     -emit-module-path "$CORE_BUILD/TilesCore.swiftmodule"
 
