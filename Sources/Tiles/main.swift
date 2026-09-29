@@ -49,7 +49,11 @@ final class WindowManager {
     }
 
     func snapFocusedWindow(at point: CGPoint) {
-        guard let window = focusedWindow(), let screen = screen(containing: point) else { return }
+        guard let window = focusedWindow() else {
+            NSLog("Tiles: no focused window found. Check Accessibility permission for Tiles/Terminal.")
+            return
+        }
+        guard let screen = screen(containing: point) else { return }
         let column = min(2, max(0, Int((point.x - screen.visibleFrame.minX) / (screen.visibleFrame.width / 3))))
         let target: (Int, Int) = slots.isEmpty ? (column == 0 ? (0, 3) : column == 2 ? (3, 6) : (1, 5)) : freeTarget(column: column)
         slots.removeAll { $0.windowID == window.id || $0.screenID == screen }
@@ -212,7 +216,8 @@ final class WindowManager {
             var number: CFTypeRef?
             AXUIElementCopyAttributeValue(item, axWindowNumberAttribute as CFString, &number)
             guard (number as? NSNumber)?.uint32Value == id else { continue }
-            var point = CGPoint(x: frame.minX, y: NSScreen.screens.first?.frame.maxY ?? 0 - frame.maxY)
+            let displayHeight = NSScreen.screens.first?.frame.maxY ?? 0
+            var point = CGPoint(x: frame.minX, y: displayHeight - frame.maxY)
             var size = CGSize(width: frame.width, height: frame.height)
             AXUIElementSetAttributeValue(item, kAXPositionAttribute as CFString, AXValueCreate(.cgPoint, &point)!)
             AXUIElementSetAttributeValue(item, kAXSizeAttribute as CFString, AXValueCreate(.cgSize, &size)!)
@@ -284,11 +289,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         item.button?.title = "▦"
-        let menu = NSMenu(); menu.addItem(withTitle: "Snap focused window under cursor", action: #selector(snap), keyEquivalent: "s"); menu.addItem(.separator()); menu.addItem(withTitle: "Quit Tiles", action: #selector(quit), keyEquivalent: "q")
+        let menu = NSMenu(); menu.addItem(withTitle: "Snap focused window under cursor", action: #selector(snap), keyEquivalent: "s"); menu.addItem(withTitle: "Accessibility status", action: #selector(accessibilityStatus), keyEquivalent: ""); menu.addItem(.separator()); menu.addItem(withTitle: "Quit Tiles", action: #selector(quit), keyEquivalent: "q")
         item.menu = menu
         manager.start()
     }
     @objc private func snap() { manager.snapFocusedWindow(at: NSEvent.mouseLocation) }
+    @objc private func accessibilityStatus() {
+        let message = AXIsProcessTrusted() ? "Accessibility access is enabled." : "Accessibility access is missing. Enable Tiles or Terminal in System Settings → Privacy & Security → Accessibility."
+        let alert = NSAlert(); alert.messageText = message; alert.runModal()
+    }
     @objc private func quit() { NSApp.terminate(nil) }
 }
 
