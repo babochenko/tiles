@@ -30,6 +30,7 @@ final class WindowManager {
     private var elements: [CGWindowID: AXUIElement] = [:]
     private var timer: Timer?
     private var leftMouseWasDown = false
+    private var ignoringMouseSequence = false
     private var boundaryDrag: (left: CGWindowID, right: CGWindowID, leftFrame: CGRect, rightFrame: CGRect)?
     private var draggedWindow: (id: CGWindowID, element: AXUIElement)?
     private var overlay: BoundaryOverlay?
@@ -156,12 +157,16 @@ final class WindowManager {
         let point = NSEvent.mouseLocation
         if isDown {
             if !leftMouseWasDown {
-                mouseDown(at: point)
-            } else {
+                let inMenuBar = screen(containing: point).map { point.y >= $0.visibleFrame.maxY } ?? false
+                let inTilesWindow = NSApp.windows.contains { $0.isVisible && $0.frame.contains(point) }
+                ignoringMouseSequence = inMenuBar || inTilesWindow
+                if !ignoringMouseSequence { mouseDown(at: point) }
+            } else if !ignoringMouseSequence {
                 mouseDragged(at: point)
             }
         } else if leftMouseWasDown {
-            mouseUp(at: point)
+            if !ignoringMouseSequence { mouseUp(at: point) }
+            ignoringMouseSequence = false
         }
         leftMouseWasDown = isDown
     }
