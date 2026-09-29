@@ -48,6 +48,33 @@ final class SnapDragGestureTests: XCTestCase {
         XCTAssertTrue(gesture.mouseUp())
     }
 
+    func testMovementJustBelowThresholdRemainsInactive() {
+        var gesture = SnapDragGesture()
+        gesture.mouseDown(at: start)
+        XCTAssertFalse(gesture.mouseDragged(to: CGPoint(x: 103.999, y: 100)))
+    }
+
+    func testVerticalAndNegativeMovementAtThresholdActivate() {
+        var vertical = SnapDragGesture()
+        vertical.mouseDown(at: start)
+        XCTAssertTrue(vertical.mouseDragged(to: CGPoint(x: 100, y: 104)))
+
+        var negative = SnapDragGesture()
+        negative.mouseDown(at: start)
+        XCTAssertTrue(negative.mouseDragged(to: CGPoint(x: 96, y: 100)))
+    }
+
+    func testZigzagPathDoesNotAccumulateDistance() {
+        var gesture = SnapDragGesture()
+        gesture.mouseDown(at: start)
+
+        for point in [CGPoint(x: 103, y: 100), CGPoint(x: 100, y: 103),
+                      CGPoint(x: 97, y: 100), CGPoint(x: 100, y: 97)] {
+            XCTAssertFalse(gesture.mouseDragged(to: point))
+        }
+        XCTAssertFalse(gesture.mouseUp())
+    }
+
     func testActivatedDragStaysActiveWhenCursorReturnsToStart() {
         var gesture = SnapDragGesture()
         gesture.mouseDown(at: start)

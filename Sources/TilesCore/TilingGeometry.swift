@@ -46,7 +46,7 @@ public enum TilingGeometry {
         if zone == .top { return [LayoutSlot(windowID: windowID, start: 0, end: 6)] }
 
         var ordered = existing.filter { $0.windowID != windowID }.sorted { $0.start < $1.start }
-        if ordered.count >= 3 {
+        while ordered.count >= 3 {
             ordered.remove(at: zone == .left ? 0 : ordered.count - 1)
         }
         let placeholder = LayoutSlot(windowID: windowID, start: 0, end: 0)

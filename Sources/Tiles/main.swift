@@ -7,25 +7,14 @@ private let margin = TilingGeometry.margin
 private let snapDistance: CGFloat = 40
 // ApplicationServices exposes this attribute at runtime but not in every SDK's Swift overlay.
 private let axWindowNumberAttribute = "AXWindowNumber"
-
-struct Slot: Equatable {
-    let windowID: CGWindowID
-    let start: Int
-    let end: Int
-    let screenID: NSScreen
-
-    static func == (lhs: Slot, rhs: Slot) -> Bool {
-        lhs.windowID == rhs.windowID && lhs.start == rhs.start && lhs.end == rhs.end && lhs.screenID == rhs.screenID
-    }
-}
+private typealias Slot = PlacedSlot<NSScreen>
 
 final class WindowManager {
     private var slots: [Slot] = []
     private var expected: [CGWindowID: CGRect] = [:]
     private var elements: [CGWindowID: AXUIElement] = [:]
     private var timer: Timer?
-    private var leftMouseWasDown = false
-    private var ignoringMouseSequence = false
+    private var mouseSequenceGate = MouseSequenceGate()
     private var boundaryDrag: (left: CGWindowID, right: CGWindowID, leftFrame: CGRect, rightFrame: CGRect)?
     private var draggedWindow: (id: CGWindowID, element: AXUIElement)?
     private var lastExternalWindow: (id: CGWindowID, element: AXUIElement)?
@@ -33,6 +22,7 @@ final class WindowManager {
     private var preview: SnapPreviewPanel?
     private var layoutWidget: LayoutPreviewPanel?
     private var zoomPalette: ZoomPalettePanel?
+    private var zoomPaletteWindowID: CGWindowID?
     private var cursorIsResizing = false
     private var activeSnapZone: SnapZone?
     private var lastZoomCheck = Date.distantPast
@@ -57,8 +47,15 @@ final class WindowManager {
             return
         }
         elements[window.id] = window.element
+        let screens = NSScreen.screens
+        let fallbackIndex = NSScreen.main.flatMap { main in screens.firstIndex(of: main) }
         guard let windowFrame = frame(of: window.id),
-              let screen = NSScreen.screens.first(where: { $0.frame.intersects(windowFrame) }) ?? NSScreen.main else { return }
+              let screenIndex = ScreenGeometry.index(
+                  intersecting: windowFrame,
+                  frames: screens.map(\.frame),
+                  fallbackIndex: fallbackIndex
+              ) else { return }
+        let screen = screens[screenIndex]
         applyPaletteLayout(to: window, start: start, end: end, screen: screen)
     }
 
@@ -75,14 +72,7 @@ final class WindowManager {
         guard let screen = screen(containing: point) else { return }
         elements[window.id] = window.element
         let zone = TilingGeometry.snapZone(at: point, in: screen.frame) ?? (point.x < screen.frame.midX ? .left : .right)
-        let existing = slots.filter { $0.screenID == screen }.map {
-            LayoutSlot(windowID: $0.windowID, start: $0.start, end: $0.end)
-        }
-        let arranged = TilingGeometry.arrange(existing: existing, inserting: window.id, in: zone)
-        slots.removeAll { $0.screenID == screen || $0.windowID == window.id }
-        for slot in arranged {
-            slots.append(Slot(windowID: slot.windowID, start: slot.start, end: slot.end, screenID: screen))
-        }
+        slots = TilingState.updatingForSnap(slots, inserting: window.id, on: screen, in: zone)
         applyLayout(on: screen)
         NSLog(zone == .top ? "Tiles: maximized window %u" : "Tiles: snapped window %u", window.id)
     }
@@ -119,7 +109,8 @@ final class WindowManager {
             let onScreen = slots.filter { $0.screenID == screen }
             for boundary in 1..<6 where onScreen.contains(where: { $0.end == boundary }) && onScreen.contains(where: { $0.start == boundary }) {
                 guard let x = boundaryX(on: screen, at: boundary) else { continue }
-                if abs(mouse.x - x) < snapDistance && mouse.y >= screen.visibleFrame.minY + margin && mouse.y <= screen.visibleFrame.maxY - margin {
+                if BoundaryGeometry.isHit(pointX: mouse.x, dividerX: x, distance: snapDistance) &&
+                    BoundaryGeometry.isVerticallyEligible(y: mouse.y, visibleFrame: screen.visibleFrame) {
                     nearestX = x
                 }
             }
@@ -138,24 +129,22 @@ final class WindowManager {
     private func pollMouse() {
         let isDown = CGEventSource.buttonState(.combinedSessionState, button: .left)
         let point = NSEvent.mouseLocation
-        if isDown {
-            if !leftMouseWasDown {
-                let inTilesWindow = NSApp.windows.contains {
-                    $0.isVisible && !$0.ignoresMouseEvents && $0.frame.contains(point)
-                }
-                ignoringMouseSequence = screen(containing: point).map {
-                    TilingGeometry.shouldIgnoreMouseDown(at: point, screenVisibleFrame: $0.visibleFrame,
-                                                         overInteractiveTilesWindow: inTilesWindow)
-                } ?? inTilesWindow
-                if !ignoringMouseSequence { mouseDown(at: point) }
-            } else if !ignoringMouseSequence {
-                mouseDragged(at: point)
+        var shouldIgnoreNewPress = false
+        if isDown && !mouseSequenceGate.isButtonDown {
+            let inTilesWindow = NSApp.windows.contains {
+                $0.isVisible && !$0.ignoresMouseEvents && $0.frame.contains(point)
             }
-        } else if leftMouseWasDown {
-            if !ignoringMouseSequence { mouseUp(at: point) }
-            ignoringMouseSequence = false
+            shouldIgnoreNewPress = screen(containing: point).map {
+                TilingGeometry.shouldIgnoreMouseDown(at: point, screenVisibleFrame: $0.visibleFrame,
+                                                     overInteractiveTilesWindow: inTilesWindow)
+            } ?? inTilesWindow
         }
-        leftMouseWasDown = isDown
+        switch mouseSequenceGate.update(isDown: isDown, ignoreNewPress: shouldIgnoreNewPress) {
+        case .down: mouseDown(at: point)
+        case .dragged: mouseDragged(at: point)
+        case .up: mouseUp(at: point)
+        case nil: break
+        }
     }
 
     private func syncLinkedResize() {
@@ -163,22 +152,21 @@ final class WindowManager {
             for right in slots where right.screenID == left.screenID && right.start == left.end {
                 guard let leftFrame = frame(of: left.windowID), let rightFrame = frame(of: right.windowID),
                       let oldLeft = expected[left.windowID], let oldRight = expected[right.windowID] else { continue }
-                let leftChanged = abs(leftFrame.maxX - oldLeft.maxX) > 1.5 && abs(leftFrame.width - oldLeft.width) > 1.5
-                let rightChanged = abs(rightFrame.minX - oldRight.minX) > 1.5 && abs(rightFrame.width - oldRight.width) > 1.5
-                guard leftChanged || rightChanged else { continue }
+                guard let update = LinkedResizeGeometry.update(
+                    left: leftFrame,
+                    right: rightFrame,
+                    expectedLeft: oldLeft,
+                    expectedRight: oldRight,
+                    linkingDistance: snapDistance
+                ) else { continue }
 
-                if leftChanged && abs(leftFrame.maxX - rightFrame.minX) <= snapDistance {
-                    var linkedRight = rightFrame
-                    linkedRight.origin.x = leftFrame.maxX + margin
-                    linkedRight.size.width = max(100, rightFrame.maxX - linkedRight.minX)
-                    setFrame(linkedRight, for: right.windowID)
-                    expected[left.windowID] = leftFrame; expected[right.windowID] = linkedRight
-                } else if rightChanged && abs(rightFrame.minX - leftFrame.maxX) <= snapDistance {
-                    var linkedLeft = leftFrame
-                    linkedLeft.size.width = max(100, rightFrame.minX - margin - leftFrame.minX)
-                    setFrame(linkedLeft, for: left.windowID)
-                    expected[left.windowID] = linkedLeft; expected[right.windowID] = rightFrame
+                if update.source == .left {
+                    setFrame(update.right, for: right.windowID)
+                } else {
+                    setFrame(update.left, for: left.windowID)
                 }
+                expected[left.windowID] = update.left
+                expected[right.windowID] = update.right
             }
         }
     }
@@ -241,8 +229,10 @@ final class WindowManager {
                 guard let left = slots.first(where: { $0.screenID == screen && $0.end == boundary }),
                       let right = slots.first(where: { $0.screenID == screen && $0.start == boundary }),
                       let leftFrame = frame(of: left.windowID), let rightFrame = frame(of: right.windowID) else { continue }
-                let x = (leftFrame.maxX + rightFrame.minX) / 2
-                if abs(point.x - x) < snapDistance { return (left.windowID, right.windowID, leftFrame, rightFrame) }
+                let x = BoundaryGeometry.dividerX(left: leftFrame, right: rightFrame)
+                if BoundaryGeometry.isHit(pointX: point.x, dividerX: x, distance: snapDistance) {
+                    return (left.windowID, right.windowID, leftFrame, rightFrame)
+                }
             }
         }
         return nil
@@ -252,7 +242,7 @@ final class WindowManager {
         guard let left = slots.first(where: { $0.screenID == screen && $0.end == boundary }),
               let right = slots.first(where: { $0.screenID == screen && $0.start == boundary }),
               let leftFrame = frame(of: left.windowID), let rightFrame = frame(of: right.windowID) else { return nil }
-        return (leftFrame.maxX + rightFrame.minX) / 2
+        return BoundaryGeometry.dividerX(left: leftFrame, right: rightFrame)
     }
 
     private func updatePreview(at point: CGPoint) {
@@ -293,7 +283,7 @@ final class WindowManager {
 
     private func updateZoomPalette() {
         guard !pendingSnap, boundaryDrag == nil else {
-            zoomPalette?.close(); zoomPalette = nil
+            zoomPalette?.close(); zoomPalette = nil; zoomPaletteWindowID = nil
             return
         }
         let mouse = NSEvent.mouseLocation
@@ -301,14 +291,19 @@ final class WindowManager {
         guard let window = focusedWindow(), let buttonFrame = zoomButtonFrame(of: window.element),
               buttonFrame.insetBy(dx: -6, dy: -6).contains(mouse),
               let screen = screen(containing: mouse) else {
-            zoomPalette?.close(); zoomPalette = nil
+            zoomPalette?.close(); zoomPalette = nil; zoomPaletteWindowID = nil
             return
         }
         elements[window.id] = window.element
+        if zoomPaletteWindowID != window.id {
+            zoomPalette?.close()
+            zoomPalette = nil
+        }
         if zoomPalette == nil {
             zoomPalette = ZoomPalettePanel { [weak self] start, end in
                 self?.applyPaletteLayout(to: window, start: start, end: end, screen: screen)
             }
+            zoomPaletteWindowID = window.id
         }
         zoomPalette?.show(below: buttonFrame, on: screen)
     }
@@ -318,15 +313,14 @@ final class WindowManager {
         guard AXUIElementCopyAttributeValue(window, kAXZoomButtonAttribute as CFString, &value) == .success,
               let value, let frame = axFrame(of: value as! AXUIElement) else { return nil }
         let displayHeight = NSScreen.screens.first?.frame.maxY ?? 0
-        return CGRect(x: frame.minX, y: displayHeight - frame.maxY, width: frame.width, height: frame.height)
+        return CoordinateGeometry.flipVertically(frame, displayHeight: displayHeight)
     }
 
     private func applyPaletteLayout(to window: (id: CGWindowID, element: AXUIElement), start: Int, end: Int, screen: NSScreen) {
         elements[window.id] = window.element
-        slots.removeAll { $0.windowID == window.id || ($0.screenID == screen && $0.start < end && $0.end > start) }
-        slots.append(Slot(windowID: window.id, start: start, end: end, screenID: screen))
+        slots = TilingState.updatingForPalette(slots, placing: window.id, start: start, end: end, on: screen)
         applyLayout(on: screen)
-        zoomPalette?.close(); zoomPalette = nil
+        zoomPalette?.close(); zoomPalette = nil; zoomPaletteWindowID = nil
         NSHapticFeedbackManager.defaultPerformer.perform(.alignment, performanceTime: .now)
     }
 
@@ -396,7 +390,7 @@ final class WindowManager {
 
     private func setFrame(_ frame: CGRect, on item: AXUIElement) {
         let displayHeight = NSScreen.screens.first?.frame.maxY ?? 0
-        var point = CGPoint(x: frame.minX, y: displayHeight - frame.maxY)
+        var point = CoordinateGeometry.flipVertically(frame, displayHeight: displayHeight).origin
         var size = CGSize(width: frame.width, height: frame.height)
         let positionResult = AXUIElementSetAttributeValue(item, kAXPositionAttribute as CFString, AXValueCreate(.cgPoint, &point)!)
         let sizeResult = AXUIElementSetAttributeValue(item, kAXSizeAttribute as CFString, AXValueCreate(.cgSize, &size)!)
@@ -408,7 +402,7 @@ final class WindowManager {
     private func frame(of id: CGWindowID) -> CGRect? {
         if let item = elements[id], let axFrame = axFrame(of: item) {
             let displayHeight = NSScreen.screens.first?.frame.maxY ?? 0
-            return CGRect(x: axFrame.minX, y: displayHeight - axFrame.maxY, width: axFrame.width, height: axFrame.height)
+            return CoordinateGeometry.flipVertically(axFrame, displayHeight: displayHeight)
         }
         guard let app = application(for: id) else { return nil }
         let axApp = AXUIElementCreateApplication(app.processIdentifier)
@@ -425,7 +419,9 @@ final class WindowManager {
             var point = CGPoint.zero; var dimensions = CGSize.zero
             AXValueGetValue(position as! AXValue, .cgPoint, &point)
             AXValueGetValue(size as! AXValue, .cgSize, &dimensions)
-            return CGRect(origin: point, size: dimensions)
+            let axFrame = CGRect(origin: point, size: dimensions)
+            let displayHeight = NSScreen.screens.first?.frame.maxY ?? 0
+            return CoordinateGeometry.flipVertically(axFrame, displayHeight: displayHeight)
         }
         return nil
     }
@@ -438,7 +434,9 @@ final class WindowManager {
 
     private func windowExists(_ id: CGWindowID) -> Bool { application(for: id) != nil }
     private func screen(containing point: CGPoint) -> NSScreen? {
-        NSScreen.screens.first { $0.frame.insetBy(dx: -2, dy: -2).contains(point) }
+        let screens = NSScreen.screens
+        guard let index = ScreenGeometry.index(containing: point, frames: screens.map(\.frame)) else { return nil }
+        return screens[index]
     }
     private func requestAccessibility() { if !AXIsProcessTrusted() { _ = AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary) } }
     private func showAccessibilityAlertIfNeeded() {
@@ -585,17 +583,13 @@ final class ZoomPalettePanel: NSPanel {
     override var canBecomeKey: Bool { false }
 
     func show(below button: CGRect, on screen: NSScreen) {
-        let x = min(screen.visibleFrame.maxX - frame.width - 8,
-                    max(screen.visibleFrame.minX + 8, button.midX - frame.width / 2))
-        let y = max(screen.visibleFrame.minY + 8, button.minY - frame.height - 6)
-        setFrameOrigin(NSPoint(x: x, y: y))
+        setFrameOrigin(PaletteGeometry.origin(below: button, paletteSize: frame.size, visibleFrame: screen.visibleFrame))
         orderFrontRegardless()
     }
 }
 
 final class ZoomPaletteView: NSView {
     private let selection: (Int, Int) -> Void
-    private let layouts = [(0, 3), (0, 6), (3, 6), (0, 2), (2, 4), (4, 6)]
 
     init(selection: @escaping (Int, Int) -> Void) {
         self.selection = selection
@@ -607,17 +601,9 @@ final class ZoomPaletteView: NSView {
 
     override func mouseDown(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
-        guard let index = layoutIndex(at: point) else { return }
-        let layout = layouts[index]
-        selection(layout.0, layout.1)
-    }
-
-    private func layoutIndex(at point: CGPoint) -> Int? {
-        let grid = NSRect(x: 9, y: 9, width: bounds.width - 18, height: bounds.height - 34)
-        guard grid.contains(point) else { return nil }
-        let column = min(2, max(0, Int((point.x - grid.minX) / (grid.width / 3))))
-        let row = point.y >= grid.midY ? 0 : 1
-        return row * 3 + column
+        guard let index = PaletteGeometry.layoutIndex(at: point, in: bounds) else { return }
+        let layout = PaletteGeometry.layouts[index]
+        selection(layout.start, layout.end)
     }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -629,10 +615,10 @@ final class ZoomPaletteView: NSView {
             .font: NSFont.systemFont(ofSize: 11, weight: .semibold)
         ])
 
-        let grid = NSRect(x: 9, y: 9, width: bounds.width - 18, height: bounds.height - 34)
+        let grid = PaletteGeometry.grid(in: bounds)
         let cellWidth = grid.width / 3
         let cellHeight = grid.height / 2
-        for index in layouts.indices {
+        for index in PaletteGeometry.layouts.indices {
             let column = index % 3
             let row = index / 3
             let cell = NSRect(x: grid.minX + CGFloat(column) * cellWidth + 3,
@@ -642,11 +628,8 @@ final class ZoomPaletteView: NSView {
             NSBezierPath(roundedRect: cell, xRadius: 6, yRadius: 6).fill()
 
             let screen = cell.insetBy(dx: 9, dy: 8)
-            let layout = layouts[index]
-            let selected = NSRect(x: screen.minX + screen.width * CGFloat(layout.0) / 6,
-                                  y: screen.minY,
-                                  width: screen.width * CGFloat(layout.1 - layout.0) / 6,
-                                  height: screen.height)
+            let layout = PaletteGeometry.layouts[index]
+            let selected = PaletteGeometry.selectedRect(for: layout, in: screen)
             NSColor.controlAccentColor.withAlphaComponent(0.75).setFill()
             NSBezierPath(roundedRect: selected, xRadius: 2, yRadius: 2).fill()
             NSColor.tertiaryLabelColor.setStroke()
