@@ -6,6 +6,7 @@ private let margin: CGFloat = 15
 private let innerMargin = margin / 2
 private let snapDistance: CGFloat = 40
 private let edgeSnapDistance: CGFloat = 60
+private let topSnapDistance = edgeSnapDistance / 2
 // ApplicationServices exposes this attribute at runtime but not in every SDK's Swift overlay.
 private let axWindowNumberAttribute = "AXWindowNumber"
 
@@ -74,7 +75,7 @@ final class WindowManager {
     private func snap(window: (id: CGWindowID, element: AXUIElement), at point: CGPoint) {
         guard let screen = screen(containing: point) else { return }
         elements[window.id] = window.element
-        if abs(point.y - screen.frame.maxY) < edgeSnapDistance {
+        if abs(point.y - screen.frame.maxY) < topSnapDistance {
             slots.removeAll { $0.screenID == screen || $0.windowID == window.id }
             slots.append(Slot(windowID: window.id, start: 0, end: 6, screenID: screen))
             applyLayout(on: screen)
@@ -236,7 +237,7 @@ final class WindowManager {
         activeSnapZone = nil
         if pendingSnap {
             if let screen = screen(containing: point),
-               (abs(point.x - screen.frame.minX) < edgeSnapDistance || abs(point.x - screen.frame.maxX) < edgeSnapDistance || abs(point.y - screen.frame.maxY) < edgeSnapDistance) {
+               (abs(point.x - screen.frame.minX) < edgeSnapDistance || abs(point.x - screen.frame.maxX) < edgeSnapDistance || abs(point.y - screen.frame.maxY) < topSnapDistance) {
                 if let window = draggedWindow ?? focusedWindow() {
                     snap(window: window, at: point)
                 } else {
@@ -277,7 +278,7 @@ final class WindowManager {
             activeSnapZone = nil
             return
         }
-        let nearTop = abs(point.y - screen.frame.maxY) < edgeSnapDistance
+        let nearTop = abs(point.y - screen.frame.maxY) < topSnapDistance
         let nearLeft = abs(point.x - screen.frame.minX) < edgeSnapDistance
         let nearRight = abs(point.x - screen.frame.maxX) < edgeSnapDistance
         let zone: SnapZone? = nearTop ? .top : nearLeft ? .left : nearRight ? .right : nil
