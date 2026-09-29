@@ -7,7 +7,7 @@
     <key>CFBundleExecutable</key>
     <string>Tiles</string>
     <key>CFBundleIdentifier</key>
-    <string>dev.babochenko.tiles</string>
+    <string>app.tiles.windowmanager</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>

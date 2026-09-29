@@ -23,8 +23,8 @@ swift "$ROOT/scripts/generate-icon.swift" "$ICONSET"
 iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
 rm -rf "$ICONSET"
 codesign --force --deep --sign - \
-    --identifier "dev.babochenko.tiles" \
-    --requirements '=designated => identifier "dev.babochenko.tiles"' \
+    --identifier "app.tiles.windowmanager" \
+    --requirements '=designated => identifier "app.tiles.windowmanager"' \
     "$APP"
 ln -s /Applications "$STAGING/Applications"
 
