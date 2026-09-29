@@ -23,14 +23,16 @@ final class WindowManager {
     private var elements: [CGWindowID: AXUIElement] = [:]
     private var timer: Timer?
     private var globalMonitor: Any?
-    private var boundaryDrag: (screen: NSScreen, boundary: Int, startX: CGFloat, original: [Slot])?
+    private var boundaryDrag: (left: CGWindowID, right: CGWindowID, leftFrame: CGRect, rightFrame: CGRect)?
     private var draggedWindow: (id: CGWindowID, element: AXUIElement)?
     private var overlay: BoundaryOverlay?
+    private var preview: SnapPreviewPanel?
+    private var cursorIsResizing = false
     private var pendingSnap = false
 
     func start() {
         requestAccessibility()
-        timer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in
+        timer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
             self?.reconcileAndShowBoundary()
         }
         globalMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .leftMouseDragged, .leftMouseUp]) { [weak self] event in
@@ -97,39 +99,59 @@ final class WindowManager {
         syncLinkedResize()
         guard boundaryDrag == nil else { return }
         let mouse = NSEvent.mouseLocation
-        var nearest: (NSScreen, Int)?
+        var nearestX: CGFloat?
         for screen in NSScreen.screens {
             let onScreen = slots.filter { $0.screenID == screen }
             for boundary in 1..<6 where onScreen.contains(where: { $0.end == boundary }) && onScreen.contains(where: { $0.start == boundary }) {
-                let x = screen.visibleFrame.minX + CGFloat(boundary) * screen.visibleFrame.width / 6
+                guard let x = boundaryX(on: screen, at: boundary) else { continue }
                 if abs(mouse.x - x) < snapDistance && mouse.y >= screen.visibleFrame.minY + margin && mouse.y <= screen.visibleFrame.maxY - margin {
-                    nearest = (screen, boundary)
+                    nearestX = x
                 }
             }
         }
         overlay?.close()
-        if let nearest { overlay = BoundaryOverlay(screen: nearest.0, boundary: nearest.1); overlay?.show() }
+        if let nearestX {
+            NSCursor.resizeLeftRight.set()
+            cursorIsResizing = true
+            overlay = BoundaryOverlay(x: nearestX, y: mouse.y); overlay?.show()
+        } else if cursorIsResizing {
+            NSCursor.arrow.set()
+            cursorIsResizing = false
+        }
     }
 
     private func syncLinkedResize() {
         for left in slots {
-            guard let leftFrame = frame(of: left.windowID), let oldFrame = expected[left.windowID],
-                  abs(leftFrame.maxX - oldFrame.maxX) > 2 || abs(leftFrame.minX - oldFrame.minX) > 2 else { continue }
             for right in slots where right.screenID == left.screenID && right.start == left.end {
-                guard let rightFrame = frame(of: right.windowID), abs(leftFrame.maxX - rightFrame.minX) < snapDistance else { continue }
-                let shared = (leftFrame.maxX + rightFrame.minX) / 2
-                var newLeft = leftFrame; newLeft.size.width = max(80, shared - 7 - newLeft.minX)
-                var newRight = rightFrame; newRight.origin.x = shared + 7; newRight.size.width = max(80, rightFrame.maxX - newRight.minX)
-                setFrame(newLeft, for: left.windowID); setFrame(newRight, for: right.windowID)
-                expected[left.windowID] = newLeft; expected[right.windowID] = newRight
+                guard let leftFrame = frame(of: left.windowID), let rightFrame = frame(of: right.windowID),
+                      let oldLeft = expected[left.windowID], let oldRight = expected[right.windowID] else { continue }
+                let leftChanged = abs(leftFrame.maxX - oldLeft.maxX) > 1.5 && abs(leftFrame.width - oldLeft.width) > 1.5
+                let rightChanged = abs(rightFrame.minX - oldRight.minX) > 1.5 && abs(rightFrame.width - oldRight.width) > 1.5
+                guard leftChanged || rightChanged else { continue }
+
+                if leftChanged && abs(leftFrame.maxX - rightFrame.minX) <= snapDistance {
+                    var linkedRight = rightFrame
+                    linkedRight.origin.x = leftFrame.maxX + margin * 2
+                    linkedRight.size.width = max(100, rightFrame.maxX - linkedRight.minX)
+                    setFrame(linkedRight, for: right.windowID)
+                    expected[left.windowID] = leftFrame; expected[right.windowID] = linkedRight
+                } else if rightChanged && abs(rightFrame.minX - leftFrame.maxX) <= snapDistance {
+                    var linkedLeft = leftFrame
+                    linkedLeft.size.width = max(100, rightFrame.minX - margin * 2 - leftFrame.minX)
+                    setFrame(linkedLeft, for: left.windowID)
+                    expected[left.windowID] = linkedLeft; expected[right.windowID] = rightFrame
+                }
             }
         }
     }
 
     fileprivate func mouseDown(at point: CGPoint) {
         if let candidate = boundaryAt(point) {
-            boundaryDrag = (candidate.screen, candidate.boundary, point.x, slots)
+            boundaryDrag = candidate
+            NSCursor.resizeLeftRight.set()
+            cursorIsResizing = true
             overlay?.close()
+            preview?.close()
             pendingSnap = false
         } else {
             pendingSnap = true
@@ -142,23 +164,22 @@ final class WindowManager {
             // On mouse-down the clicked application may not yet have become
             // frontmost. Resolve it again once the system starts the drag.
             draggedWindow = focusedWindow() ?? draggedWindow
+            updatePreview(at: point)
             return
         }
-        let delta = point.x - drag.startX
-        let screen = drag.screen
-        let unit = screen.visibleFrame.width / 6
-        let change = Int(round(delta / unit))
-        guard change != 0 else { return }
-        slots = drag.original.map { slot in
-            guard slot.screenID == screen else { return slot }
-            if slot.end == drag.boundary { return Slot(windowID: slot.windowID, start: slot.start, end: max(slot.start + 1, min(5, drag.boundary + change)), screenID: screen) }
-            if slot.start == drag.boundary { return Slot(windowID: slot.windowID, start: max(1, min(drag.boundary + change, slot.end - 1)), end: slot.end, screenID: screen) }
-            return slot
-        }
-        applyLayout(on: screen)
+        let divider = min(drag.rightFrame.maxX - 100 - margin, max(drag.leftFrame.minX + 100 + margin, point.x))
+        var leftFrame = drag.leftFrame
+        var rightFrame = drag.rightFrame
+        leftFrame.size.width = divider - margin - leftFrame.minX
+        rightFrame.origin.x = divider + margin
+        rightFrame.size.width = drag.rightFrame.maxX - rightFrame.minX
+        setFrame(leftFrame, for: drag.left); setFrame(rightFrame, for: drag.right)
+        expected[drag.left] = leftFrame; expected[drag.right] = rightFrame
     }
 
     fileprivate func mouseUp(at point: CGPoint) {
+        preview?.close()
+        preview = nil
         if pendingSnap {
             if let screen = screen(containing: point),
                (abs(point.x - screen.frame.minX) < 40 || abs(point.x - screen.frame.maxX) < 40) {
@@ -172,19 +193,43 @@ final class WindowManager {
         pendingSnap = false
         draggedWindow = nil
         boundaryDrag = nil
+        if cursorIsResizing { NSCursor.arrow.set(); cursorIsResizing = false }
     }
 
-    private func boundaryAt(_ point: CGPoint) -> (screen: NSScreen, boundary: Int)? {
+    private func boundaryAt(_ point: CGPoint) -> (left: CGWindowID, right: CGWindowID, leftFrame: CGRect, rightFrame: CGRect)? {
         for screen in NSScreen.screens {
-            let unit = screen.visibleFrame.width / 6
             for boundary in 1..<6 {
-                let x = screen.visibleFrame.minX + CGFloat(boundary) * unit
-                let left = slots.contains { $0.screenID == screen && $0.end == boundary }
-                let right = slots.contains { $0.screenID == screen && $0.start == boundary }
-                if left && right && abs(point.x - x) < snapDistance { return (screen, boundary) }
+                guard let left = slots.first(where: { $0.screenID == screen && $0.end == boundary }),
+                      let right = slots.first(where: { $0.screenID == screen && $0.start == boundary }),
+                      let leftFrame = frame(of: left.windowID), let rightFrame = frame(of: right.windowID) else { continue }
+                let x = (leftFrame.maxX + rightFrame.minX) / 2
+                if abs(point.x - x) < snapDistance { return (left.windowID, right.windowID, leftFrame, rightFrame) }
             }
         }
         return nil
+    }
+
+    private func boundaryX(on screen: NSScreen, at boundary: Int) -> CGFloat? {
+        guard let left = slots.first(where: { $0.screenID == screen && $0.end == boundary }),
+              let right = slots.first(where: { $0.screenID == screen && $0.start == boundary }),
+              let leftFrame = frame(of: left.windowID), let rightFrame = frame(of: right.windowID) else { return nil }
+        return (leftFrame.maxX + rightFrame.minX) / 2
+    }
+
+    private func updatePreview(at point: CGPoint) {
+        guard let screen = screen(containing: point),
+              abs(point.x - screen.frame.minX) < 60 || abs(point.x - screen.frame.maxX) < 60 else {
+            preview?.close(); preview = nil
+            return
+        }
+        let count = min(3, slots.filter { $0.screenID == screen && $0.windowID != draggedWindow?.id }.count + 1)
+        let isLeft = abs(point.x - screen.frame.minX) < abs(point.x - screen.frame.maxX)
+        let width = count == 1 ? screen.visibleFrame.width / 2 : screen.visibleFrame.width / CGFloat(count)
+        let x = isLeft ? screen.visibleFrame.minX + margin : screen.visibleFrame.maxX - width + margin
+        let target = CGRect(x: x, y: screen.visibleFrame.minY + margin,
+                            width: width - margin * 2, height: screen.visibleFrame.height - margin * 2)
+        if preview == nil { preview = SnapPreviewPanel() }
+        preview?.show(frame: target)
     }
 
     private func focusedWindow() -> (id: CGWindowID, element: AXUIElement)? {
@@ -294,13 +339,34 @@ final class WindowManager {
 }
 
 final class BoundaryOverlay: NSPanel {
-    init(screen: NSScreen, boundary: Int) {
-        let x = screen.visibleFrame.minX + CGFloat(boundary) * screen.visibleFrame.width / 6
-        super.init(contentRect: NSRect(x: x - 13, y: screen.visibleFrame.midY - 13, width: 26, height: 26), styleMask: .borderless, backing: .buffered, defer: false)
+    init(x: CGFloat, y: CGFloat) {
+        super.init(contentRect: NSRect(x: x - 13, y: y - 13, width: 26, height: 26), styleMask: .borderless, backing: .buffered, defer: false)
         isFloatingPanel = true; level = .screenSaver; backgroundColor = .clear; isOpaque = false; ignoresMouseEvents = true
         contentView = GripView()
     }
     func show() { orderFrontRegardless() }
+}
+
+final class SnapPreviewPanel: NSPanel {
+    init() {
+        super.init(contentRect: .zero, styleMask: .borderless, backing: .buffered, defer: false)
+        isFloatingPanel = true
+        level = .floating
+        isOpaque = false
+        backgroundColor = NSColor.controlAccentColor.withAlphaComponent(0.22)
+        ignoresMouseEvents = true
+        hasShadow = false
+        collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        contentView?.wantsLayer = true
+        contentView?.layer?.cornerRadius = 10
+        contentView?.layer?.borderWidth = 2
+        contentView?.layer?.borderColor = NSColor.controlAccentColor.withAlphaComponent(0.8).cgColor
+    }
+
+    func show(frame: CGRect) {
+        setFrame(frame, display: true)
+        orderFrontRegardless()
+    }
 }
 
 final class GripView: NSView {
