@@ -7,6 +7,10 @@ private let snapDistance: CGFloat = 40
 // ApplicationServices exposes this attribute at runtime but not in every SDK's Swift overlay.
 private let axWindowNumberAttribute = "AXWindowNumber"
 
+private enum SnapZone: Equatable {
+    case left, right, top
+}
+
 struct Slot: Equatable {
     let windowID: CGWindowID
     let start: Int
@@ -28,14 +32,18 @@ final class WindowManager {
     private var draggedWindow: (id: CGWindowID, element: AXUIElement)?
     private var overlay: BoundaryOverlay?
     private var preview: SnapPreviewPanel?
+    private var layoutWidget: LayoutPreviewPanel?
     private var cursorIsResizing = false
+    private var activeSnapZone: SnapZone?
     private var pendingSnap = false
 
     func start() {
         requestAccessibility()
-        timer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
+        let refreshTimer = Timer(timeInterval: 1.0 / 120.0, repeats: true) { [weak self] _ in
             self?.reconcileAndShowBoundary()
         }
+        RunLoop.main.add(refreshTimer, forMode: .common)
+        timer = refreshTimer
         globalMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .leftMouseDragged, .leftMouseUp]) { [weak self] event in
             guard let self else { return }
             let point = NSEvent.mouseLocation
@@ -190,6 +198,9 @@ final class WindowManager {
     fileprivate func mouseUp(at point: CGPoint) {
         preview?.close()
         preview = nil
+        layoutWidget?.close()
+        layoutWidget = nil
+        activeSnapZone = nil
         if pendingSnap {
             if let screen = screen(containing: point),
                (abs(point.x - screen.frame.minX) < 40 || abs(point.x - screen.frame.maxX) < 40 || abs(point.y - screen.frame.maxY) < 40) {
@@ -229,11 +240,32 @@ final class WindowManager {
     private func updatePreview(at point: CGPoint) {
         guard let screen = screen(containing: point) else {
             preview?.close(); preview = nil
+            layoutWidget?.close(); layoutWidget = nil
+            activeSnapZone = nil
             return
         }
         let nearTop = abs(point.y - screen.frame.maxY) < 60
         let nearLeft = abs(point.x - screen.frame.minX) < 60
         let nearRight = abs(point.x - screen.frame.maxX) < 60
+        let zone: SnapZone? = nearTop ? .top : nearLeft ? .left : nearRight ? .right : nil
+        if let zone, zone != activeSnapZone {
+            NSHapticFeedbackManager.defaultPerformer.perform(.alignment, performanceTime: .now)
+        }
+        activeSnapZone = zone
+        let current = slots.filter { $0.screenID == screen && $0.windowID != draggedWindow?.id }
+            .map { (CGFloat($0.start) / 6, CGFloat($0.end) / 6) }
+        var future: (CGFloat, CGFloat)?
+        if nearTop {
+            future = (0, 1)
+        } else if nearLeft || nearRight {
+            let existingCount = current.count
+            let columns = max(2, min(3, existingCount + 1))
+            let index = nearLeft ? 0 : columns - 1
+            future = (CGFloat(index) / CGFloat(columns), CGFloat(index + 1) / CGFloat(columns))
+        }
+        if layoutWidget == nil { layoutWidget = LayoutPreviewPanel() }
+        layoutWidget?.show(on: screen, current: current, future: future)
+
         guard nearTop || nearLeft || nearRight else {
             preview?.close(); preview = nil
             return
@@ -410,6 +442,77 @@ final class GripView: NSView {
         NSBezierPath(roundedRect: bounds.insetBy(dx: 3, dy: 3), xRadius: 6, yRadius: 6).fill()
         let text = NSString(string: "↔")
         text.draw(at: NSPoint(x: 5, y: 4), withAttributes: [.foregroundColor: NSColor.white, .font: NSFont.systemFont(ofSize: 14, weight: .bold)])
+    }
+}
+
+final class LayoutPreviewPanel: NSPanel {
+    private let previewView = LayoutPreviewView()
+
+    init() {
+        super.init(contentRect: NSRect(x: 0, y: 0, width: 220, height: 92), styleMask: .borderless, backing: .buffered, defer: false)
+        isFloatingPanel = true
+        level = .screenSaver
+        isOpaque = false
+        backgroundColor = .clear
+        ignoresMouseEvents = true
+        hasShadow = true
+        collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        contentView = previewView
+    }
+
+    func show(on screen: NSScreen, current: [(CGFloat, CGFloat)], future: (CGFloat, CGFloat)?) {
+        let size = frame.size
+        setFrameOrigin(NSPoint(x: screen.visibleFrame.maxX - size.width - margin,
+                               y: screen.visibleFrame.maxY - size.height - margin))
+        previewView.current = current
+        previewView.future = future
+        previewView.needsDisplay = true
+        orderFrontRegardless()
+    }
+}
+
+final class LayoutPreviewView: NSView {
+    var current: [(CGFloat, CGFloat)] = []
+    var future: (CGFloat, CGFloat)?
+
+    override func draw(_ dirtyRect: NSRect) {
+        let background = NSBezierPath(roundedRect: bounds, xRadius: 12, yRadius: 12)
+        NSColor.windowBackgroundColor.withAlphaComponent(0.94).setFill()
+        background.fill()
+
+        let title = NSString(string: future == nil ? "Current layout" : "Drop preview")
+        title.draw(at: NSPoint(x: 12, y: 66), withAttributes: [
+            .foregroundColor: NSColor.labelColor,
+            .font: NSFont.systemFont(ofSize: 12, weight: .semibold)
+        ])
+
+        let canvas = NSRect(x: 12, y: 12, width: bounds.width - 24, height: 46)
+        NSColor.separatorColor.setStroke()
+        let outline = NSBezierPath(roundedRect: canvas, xRadius: 5, yRadius: 5)
+        outline.lineWidth = 1
+        outline.stroke()
+
+        for range in current {
+            let rect = NSRect(x: canvas.minX + canvas.width * range.0 + 2,
+                              y: canvas.minY + 2,
+                              width: canvas.width * (range.1 - range.0) - 4,
+                              height: canvas.height - 4)
+            NSColor.secondaryLabelColor.withAlphaComponent(0.18).setFill()
+            NSBezierPath(roundedRect: rect, xRadius: 3, yRadius: 3).fill()
+        }
+
+        if let future {
+            let rect = NSRect(x: canvas.minX + canvas.width * future.0 + 2,
+                              y: canvas.minY + 2,
+                              width: canvas.width * (future.1 - future.0) - 4,
+                              height: canvas.height - 4)
+            let path = NSBezierPath(roundedRect: rect, xRadius: 3, yRadius: 3)
+            NSColor.controlAccentColor.withAlphaComponent(0.55).setFill()
+            path.fill()
+            path.lineWidth = 2
+            NSColor.controlAccentColor.setStroke()
+            path.stroke()
+        }
     }
 }
 
