@@ -1,5 +1,6 @@
 import AppKit
 import ApplicationServices
+import ServiceManagement
 
 private let margin: CGFloat = 15
 private let innerMargin = margin / 2
@@ -516,16 +517,49 @@ final class LayoutPreviewView: NSView {
     }
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let manager = WindowManager()
     private var statusItem: NSStatusItem?
+    private var launchAtStartupItem: NSMenuItem?
     func applicationDidFinishLaunching(_ notification: Notification) {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         statusItem = item
         item.button?.title = "▦"
-        let menu = NSMenu(); menu.addItem(withTitle: "Snap focused window under cursor", action: #selector(snap), keyEquivalent: "s"); menu.addItem(withTitle: "Accessibility status", action: #selector(accessibilityStatus), keyEquivalent: ""); menu.addItem(.separator()); menu.addItem(withTitle: "Quit Tiles", action: #selector(quit), keyEquivalent: "q")
+        let menu = NSMenu()
+        menu.delegate = self
+        let launchItem = menu.addItem(withTitle: "Launch at startup", action: #selector(toggleLaunchAtStartup), keyEquivalent: "")
+        launchItem.target = self
+        launchAtStartupItem = launchItem
+        menu.addItem(.separator())
+        let snapItem = menu.addItem(withTitle: "Snap focused window under cursor", action: #selector(snap), keyEquivalent: "s")
+        snapItem.target = self
+        let accessibilityItem = menu.addItem(withTitle: "Accessibility status", action: #selector(accessibilityStatus), keyEquivalent: "")
+        accessibilityItem.target = self
+        menu.addItem(.separator())
+        let quitItem = menu.addItem(withTitle: "Quit Tiles", action: #selector(quit), keyEquivalent: "q")
+        quitItem.target = self
         item.menu = menu
+        updateLaunchAtStartupItem()
         manager.start()
+    }
+    func menuWillOpen(_ menu: NSMenu) { updateLaunchAtStartupItem() }
+    @objc private func toggleLaunchAtStartup() {
+        do {
+            if SMAppService.mainApp.status == .enabled {
+                try SMAppService.mainApp.unregister()
+            } else {
+                try SMAppService.mainApp.register()
+            }
+            updateLaunchAtStartupItem()
+        } catch {
+            let alert = NSAlert()
+            alert.messageText = "Could not update Launch at startup"
+            alert.informativeText = "Install Tiles in Applications and try again.\n\n\(error.localizedDescription)"
+            alert.runModal()
+        }
+    }
+    private func updateLaunchAtStartupItem() {
+        launchAtStartupItem?.state = SMAppService.mainApp.status == .enabled ? .on : .off
     }
     @objc private func snap() { manager.snapFocusedWindow(at: NSEvent.mouseLocation) }
     @objc private func accessibilityStatus() {
