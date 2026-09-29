@@ -258,7 +258,7 @@ final class WindowManager {
         let nearLeft = abs(point.x - screen.frame.minX) < 60
         let nearRight = abs(point.x - screen.frame.maxX) < 60
         let zone: SnapZone? = nearTop ? .top : nearLeft ? .left : nearRight ? .right : nil
-        if let zone, zone != activeSnapZone {
+        if zone != activeSnapZone && (zone != nil || activeSnapZone != nil) {
             NSHapticFeedbackManager.defaultPerformer.perform(.alignment, performanceTime: .now)
         }
         activeSnapZone = zone
