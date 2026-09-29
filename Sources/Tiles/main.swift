@@ -1,18 +1,12 @@
 import AppKit
 import ApplicationServices
 import ServiceManagement
+import TilesCore
 
-private let margin: CGFloat = 15
-private let innerMargin = margin / 2
+private let margin = TilingGeometry.margin
 private let snapDistance: CGFloat = 40
-private let edgeSnapDistance: CGFloat = 60
-private let topSnapDistance = edgeSnapDistance / 2
 // ApplicationServices exposes this attribute at runtime but not in every SDK's Swift overlay.
 private let axWindowNumberAttribute = "AXWindowNumber"
-
-private enum SnapZone: Equatable {
-    case left, right, top
-}
 
 struct Slot: Equatable {
     let windowID: CGWindowID
@@ -34,6 +28,7 @@ final class WindowManager {
     private var ignoringMouseSequence = false
     private var boundaryDrag: (left: CGWindowID, right: CGWindowID, leftFrame: CGRect, rightFrame: CGRect)?
     private var draggedWindow: (id: CGWindowID, element: AXUIElement)?
+    private var lastExternalWindow: (id: CGWindowID, element: AXUIElement)?
     private var overlay: BoundaryOverlay?
     private var preview: SnapPreviewPanel?
     private var layoutWidget: LayoutPreviewPanel?
@@ -41,6 +36,7 @@ final class WindowManager {
     private var cursorIsResizing = false
     private var activeSnapZone: SnapZone?
     private var lastZoomCheck = Date.distantPast
+    private var lastSlotCleanup = Date.distantPast
     private var pendingSnap = false
 
     func start() {
@@ -48,13 +44,14 @@ final class WindowManager {
         let refreshTimer = Timer(timeInterval: 1.0 / 120.0, repeats: true) { [weak self] _ in
             self?.reconcileAndShowBoundary()
         }
+        refreshTimer.tolerance = 0
         RunLoop.main.add(refreshTimer, forMode: .common)
         timer = refreshTimer
         NSLog("Tiles: running. Drag a window to a physical screen edge and release it.")
     }
 
     func tileFocusedWindow(start: Int, end: Int) {
-        guard let window = focusedWindow() else {
+        guard let window = focusedWindow() ?? lastExternalWindow else {
             showAccessibilityAlertIfNeeded()
             return
         }
@@ -65,8 +62,9 @@ final class WindowManager {
     }
 
     func snapFocusedWindow(at point: CGPoint) {
-        guard let window = focusedWindow() else {
+        guard let window = focusedWindow() ?? lastExternalWindow else {
             NSLog("Tiles: no focused window found. Check Accessibility permission for Tiles/Terminal.")
+            showAccessibilityAlertIfNeeded()
             return
         }
         snap(window: window, at: point)
@@ -75,45 +73,26 @@ final class WindowManager {
     private func snap(window: (id: CGWindowID, element: AXUIElement), at point: CGPoint) {
         guard let screen = screen(containing: point) else { return }
         elements[window.id] = window.element
-        if abs(point.y - screen.frame.maxY) < topSnapDistance {
-            slots.removeAll { $0.screenID == screen || $0.windowID == window.id }
-            slots.append(Slot(windowID: window.id, start: 0, end: 6, screenID: screen))
-            applyLayout(on: screen)
-            NSLog("Tiles: maximized window %u", window.id)
-            return
+        let zone = TilingGeometry.snapZone(at: point, in: screen.frame) ?? (point.x < screen.frame.midX ? .left : .right)
+        let existing = slots.filter { $0.screenID == screen }.map {
+            LayoutSlot(windowID: $0.windowID, start: $0.start, end: $0.end)
         }
-        let column = min(2, max(0, Int((point.x - screen.visibleFrame.minX) / (screen.visibleFrame.width / 3))))
-        var ordered = slots.filter { $0.screenID == screen && $0.windowID != window.id }.sorted { $0.start < $1.start }
-        if ordered.count == 3 {
-            ordered.remove(at: column == 0 ? 0 : column == 2 ? 2 : 1)
-        }
-        let insertion = column == 0 ? 0 : column == 2 ? ordered.count : ordered.count / 2
-        ordered.insert(Slot(windowID: window.id, start: 0, end: 0, screenID: screen), at: insertion)
-
+        let arranged = TilingGeometry.arrange(existing: existing, inserting: window.id, in: zone)
         slots.removeAll { $0.screenID == screen || $0.windowID == window.id }
-        if ordered.count == 1 {
-            let range = column == 2 ? (3, 6) : column == 1 ? (1, 5) : (0, 3)
-            slots.append(Slot(windowID: window.id, start: range.0, end: range.1, screenID: screen))
-        } else {
-            let boundaries = ordered.count == 2 ? [0, 3, 6] : [0, 2, 4, 6]
-            for (index, slot) in ordered.enumerated() {
-                slots.append(Slot(windowID: slot.windowID, start: boundaries[index], end: boundaries[index + 1], screenID: screen))
-            }
+        for slot in arranged {
+            slots.append(Slot(windowID: slot.windowID, start: slot.start, end: slot.end, screenID: screen))
         }
         applyLayout(on: screen)
-        NSLog("Tiles: snapped window %u", window.id)
+        NSLog(zone == .top ? "Tiles: maximized window %u" : "Tiles: snapped window %u", window.id)
     }
 
     private func applyLayout(on screen: NSScreen) {
         let screenSlots = slots.filter { $0.screenID == screen }
-        let unit = screen.visibleFrame.width / 6
         for slot in screenSlots {
-            let leftInset = slot.start == 0 ? margin : innerMargin
-            let rightInset = slot.end == 6 ? margin : innerMargin
-            let frame = CGRect(x: screen.visibleFrame.minX + CGFloat(slot.start) * unit + leftInset,
-                               y: screen.visibleFrame.minY + margin,
-                               width: CGFloat(slot.end - slot.start) * unit - leftInset - rightInset,
-                               height: screen.visibleFrame.height - margin * 2)
+            let frame = TilingGeometry.frame(
+                for: LayoutSlot(windowID: slot.windowID, start: slot.start, end: slot.end),
+                in: screen.visibleFrame
+            )
             setFrame(frame, for: slot.windowID)
             expected[slot.windowID] = frame
         }
@@ -121,16 +100,18 @@ final class WindowManager {
 
     private func reconcileAndShowBoundary() {
         pollMouse()
-        slots = slots.filter { windowExists($0.windowID) }
-        syncLinkedResize()
-        if pendingSnap && boundaryDrag == nil {
-            updatePreview(at: NSEvent.mouseLocation)
+        // Boundary dragging is the latency-sensitive path. Avoid AX reads,
+        // CGWindow scans, and overlay work after writing both window frames.
+        guard boundaryDrag == nil else { return }
+        if Date().timeIntervalSince(lastSlotCleanup) >= 1 {
+            lastSlotCleanup = Date()
+            slots = slots.filter { windowExists($0.windowID) }
         }
+        syncLinkedResize()
         if Date().timeIntervalSince(lastZoomCheck) >= 0.08 {
             lastZoomCheck = Date()
             updateZoomPalette()
         }
-        guard boundaryDrag == nil else { return }
         let mouse = NSEvent.mouseLocation
         var nearestX: CGFloat?
         for screen in NSScreen.screens {
@@ -158,11 +139,13 @@ final class WindowManager {
         let point = NSEvent.mouseLocation
         if isDown {
             if !leftMouseWasDown {
-                let inMenuBar = screen(containing: point).map { point.y >= $0.visibleFrame.maxY } ?? false
                 let inTilesWindow = NSApp.windows.contains {
                     $0.isVisible && !$0.ignoresMouseEvents && $0.frame.contains(point)
                 }
-                ignoringMouseSequence = inMenuBar || inTilesWindow
+                ignoringMouseSequence = screen(containing: point).map {
+                    TilingGeometry.shouldIgnoreMouseDown(at: point, screenVisibleFrame: $0.visibleFrame,
+                                                         overInteractiveTilesWindow: inTilesWindow)
+                } ?? inTilesWindow
                 if !ignoringMouseSequence { mouseDown(at: point) }
             } else if !ignoringMouseSequence {
                 mouseDragged(at: point)
@@ -221,14 +204,9 @@ final class WindowManager {
             updatePreview(at: point)
             return
         }
-        let divider = min(drag.rightFrame.maxX - 100 - innerMargin, max(drag.leftFrame.minX + 100 + innerMargin, point.x))
-        var leftFrame = drag.leftFrame
-        var rightFrame = drag.rightFrame
-        leftFrame.size.width = divider - innerMargin - leftFrame.minX
-        rightFrame.origin.x = divider + innerMargin
-        rightFrame.size.width = drag.rightFrame.maxX - rightFrame.minX
-        setFrame(leftFrame, for: drag.left); setFrame(rightFrame, for: drag.right)
-        expected[drag.left] = leftFrame; expected[drag.right] = rightFrame
+        let frames = TilingGeometry.linkedFrames(left: drag.leftFrame, right: drag.rightFrame, divider: point.x)
+        setFrame(frames.left, for: drag.left); setFrame(frames.right, for: drag.right)
+        expected[drag.left] = frames.left; expected[drag.right] = frames.right
     }
 
     fileprivate func mouseUp(at point: CGPoint) {
@@ -238,8 +216,7 @@ final class WindowManager {
         layoutWidget = nil
         activeSnapZone = nil
         if pendingSnap {
-            if let screen = screen(containing: point),
-               (abs(point.x - screen.frame.minX) < edgeSnapDistance || abs(point.x - screen.frame.maxX) < edgeSnapDistance || abs(point.y - screen.frame.maxY) < topSnapDistance) {
+            if let screen = screen(containing: point), TilingGeometry.snapZone(at: point, in: screen.frame) != nil {
                 if let window = draggedWindow ?? focusedWindow() {
                     snap(window: window, at: point)
                 } else {
@@ -280,49 +257,31 @@ final class WindowManager {
             activeSnapZone = nil
             return
         }
-        let nearTop = abs(point.y - screen.frame.maxY) < topSnapDistance
-        let nearLeft = abs(point.x - screen.frame.minX) < edgeSnapDistance
-        let nearRight = abs(point.x - screen.frame.maxX) < edgeSnapDistance
-        let zone: SnapZone? = nearTop ? .top : nearLeft ? .left : nearRight ? .right : nil
-        if zone != activeSnapZone && (zone != nil || activeSnapZone != nil) {
+        let zone = TilingGeometry.snapZone(at: point, in: screen.frame)
+        if TilingGeometry.shouldHaptic(from: activeSnapZone, to: zone) {
             NSHapticFeedbackManager.defaultPerformer.perform(.alignment, performanceTime: .now)
         }
         activeSnapZone = zone
         let current = slots.filter { $0.screenID == screen && $0.windowID != draggedWindow?.id }
             .map { (CGFloat($0.start) / 6, CGFloat($0.end) / 6) }
         var future: (CGFloat, CGFloat)?
-        if nearTop {
-            future = (0, 1)
-        } else if nearLeft || nearRight {
-            let existingCount = current.count
-            let columns = max(2, min(3, existingCount + 1))
-            let index = nearLeft ? 0 : columns - 1
-            future = (CGFloat(index) / CGFloat(columns), CGFloat(index + 1) / CGFloat(columns))
+        if let zone {
+            let range = TilingGeometry.previewRange(existingCount: current.count, zone: zone)
+            future = (range.lowerBound, range.upperBound)
         }
         if layoutWidget == nil { layoutWidget = LayoutPreviewPanel() }
         layoutWidget?.show(on: screen, current: current, future: future)
 
-        guard nearTop || nearLeft || nearRight else {
+        guard let zone else {
             preview?.close(); preview = nil
             return
         }
 
-        let target: CGRect
-        if nearTop {
-            target = screen.visibleFrame.insetBy(dx: margin, dy: margin)
-        } else {
-            let existingCount = slots.filter { $0.screenID == screen && $0.windowID != draggedWindow?.id }.count
-            let columns = max(2, min(3, existingCount + 1))
-            let isLeft = nearLeft
-            let index = isLeft ? 0 : columns - 1
-            let columnWidth = screen.visibleFrame.width / CGFloat(columns)
-            let leftInset = index == 0 ? margin : innerMargin
-            let rightInset = index == columns - 1 ? margin : innerMargin
-            target = CGRect(x: screen.visibleFrame.minX + CGFloat(index) * columnWidth + leftInset,
-                            y: screen.visibleFrame.minY + margin,
-                            width: columnWidth - leftInset - rightInset,
-                            height: screen.visibleFrame.height - margin * 2)
-        }
+        let range = TilingGeometry.previewRange(existingCount: current.count, zone: zone)
+        let target = TilingGeometry.frame(
+            for: LayoutSlot(windowID: 0, start: Int(round(range.lowerBound * 6)), end: Int(round(range.upperBound * 6))),
+            in: screen.visibleFrame
+        )
         if preview == nil { preview = SnapPreviewPanel() }
         preview?.show(frame: target)
     }
@@ -376,7 +335,11 @@ final class WindowManager {
         let window = value as! AXUIElement
         var number: CFTypeRef?
         AXUIElementCopyAttributeValue(window, axWindowNumberAttribute as CFString, &number)
-        if let number = number as? NSNumber { return (CGWindowID(number.uint32Value), window) }
+        if let number = number as? NSNumber {
+            let result = (id: CGWindowID(number.uint32Value), element: window)
+            lastExternalWindow = result
+            return result
+        }
 
         // AXWindowNumber is not exported by all macOS SDKs and is absent for
         // some applications. Match the focused AX window to its CG window by
@@ -390,7 +353,9 @@ final class WindowManager {
             var cgFrame = CGRect.zero
             guard CGRectMakeWithDictionaryRepresentation(bounds, &cgFrame), abs(cgFrame.width - axFrame.width) < 3,
                   abs(cgFrame.height - axFrame.height) < 3 else { continue }
-            return (CGWindowID(number.uint32Value), window)
+            let result = (id: CGWindowID(number.uint32Value), element: window)
+            lastExternalWindow = result
+            return result
         }
         return nil
     }

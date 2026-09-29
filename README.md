@@ -23,3 +23,9 @@ To rebuild from source and install it automatically, replacing an existing insta
 ```bash
 ./scripts/install.sh
 ```
+
+Run the focused UX unit tests manually with:
+
+```bash
+./scripts/test.sh
+```

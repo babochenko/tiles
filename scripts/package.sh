@@ -10,11 +10,24 @@ DMG="$DIST/Tiles.dmg"
 rm -rf "$DIST"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
+CORE_BUILD="$DIST/TilesCore"
+mkdir -p "$CORE_BUILD"
+swiftc -O \
+    -parse-as-library \
+    -emit-object \
+    -emit-module \
+    -module-name TilesCore \
+    "$ROOT/Sources/TilesCore/TilingGeometry.swift" \
+    -o "$CORE_BUILD/TilesCore.o" \
+    -emit-module-path "$CORE_BUILD/TilesCore.swiftmodule"
+
 swiftc -O \
     -framework AppKit \
     -framework ApplicationServices \
     -framework ServiceManagement \
+    -I "$CORE_BUILD" \
     "$ROOT/Sources/Tiles/main.swift" \
+    "$CORE_BUILD/TilesCore.o" \
     -o "$APP/Contents/MacOS/Tiles"
 
 cp "$ROOT/Resources/Info.plist" "$APP/Contents/Info.plist"
