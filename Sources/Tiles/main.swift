@@ -2,7 +2,7 @@ import AppKit
 import ApplicationServices
 
 private let margin: CGFloat = 15
-private let snapDistance: CGFloat = 28
+private let snapDistance: CGFloat = 40
 // ApplicationServices exposes this attribute at runtime but not in every SDK's Swift overlay.
 private let axWindowNumberAttribute = "AXWindowNumber"
 
@@ -20,9 +20,11 @@ struct Slot: Equatable {
 final class WindowManager {
     private var slots: [Slot] = []
     private var expected: [CGWindowID: CGRect] = [:]
+    private var elements: [CGWindowID: AXUIElement] = [:]
     private var timer: Timer?
-    private var eventTap: CFMachPort?
+    private var globalMonitor: Any?
     private var boundaryDrag: (screen: NSScreen, boundary: Int, startX: CGFloat, original: [Slot])?
+    private var draggedWindow: (id: CGWindowID, element: AXUIElement)?
     private var overlay: BoundaryOverlay?
     private var pendingSnap = false
 
@@ -31,21 +33,17 @@ final class WindowManager {
         timer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in
             self?.reconcileAndShowBoundary()
         }
-        let mask = CGEventMask(1 << CGEventType.leftMouseDown.rawValue |
-                               1 << CGEventType.leftMouseDragged.rawValue |
-                               1 << CGEventType.leftMouseUp.rawValue)
-        let context = Unmanaged.passUnretained(self).toOpaque()
-        eventTap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap,
-                                     options: .listenOnly, eventsOfInterest: mask, callback: eventCallback,
-                                     userInfo: context)
-        if eventTap == nil {
-            NSLog("Tiles: could not create the global mouse event tap. Enable Accessibility access for Tiles or Terminal.")
+        globalMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .leftMouseDragged, .leftMouseUp]) { [weak self] event in
+            guard let self else { return }
+            let point = NSEvent.mouseLocation
+            switch event.type {
+            case .leftMouseDown: self.mouseDown(at: point)
+            case .leftMouseDragged: self.mouseDragged(at: point)
+            case .leftMouseUp: self.mouseUp(at: point)
+            default: break
+            }
         }
-        if let eventTap {
-            let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, eventTap, 0)
-            CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
-            CGEvent.tapEnable(tap: eventTap, enable: true)
-        }
+        NSLog("Tiles: running. Drag a window to a physical screen edge and release it.")
     }
 
     func snapFocusedWindow(at point: CGPoint) {
@@ -53,22 +51,32 @@ final class WindowManager {
             NSLog("Tiles: no focused window found. Check Accessibility permission for Tiles/Terminal.")
             return
         }
-        guard let screen = screen(containing: point) else { return }
-        let column = min(2, max(0, Int((point.x - screen.visibleFrame.minX) / (screen.visibleFrame.width / 3))))
-        let target: (Int, Int) = slots.isEmpty ? (column == 0 ? (0, 3) : column == 2 ? (3, 6) : (1, 5)) : freeTarget(column: column)
-        slots.removeAll { $0.windowID == window.id || $0.screenID == screen }
-        slots.append(Slot(windowID: window.id, start: target.0, end: target.1, screenID: screen))
-        applyLayout(on: screen)
+        snap(window: window, at: point)
     }
 
-    private func freeTarget(column: Int) -> (Int, Int) {
-        let occupied = slots.filter { $0.start <= column && $0.end > column }
-        if occupied.isEmpty { return (column, column + 1) }
-        if slots.count >= 3 { // Three columns are the limit: replace the nearest slot.
-            let nearest = slots.min { abs(($0.start + $0.end) / 2 - column) < abs(($1.start + $1.end) / 2 - column) }
-            if let nearest { slots.removeAll { $0 == nearest } }
+    private func snap(window: (id: CGWindowID, element: AXUIElement), at point: CGPoint) {
+        guard let screen = screen(containing: point) else { return }
+        elements[window.id] = window.element
+        let column = min(2, max(0, Int((point.x - screen.visibleFrame.minX) / (screen.visibleFrame.width / 3))))
+        var ordered = slots.filter { $0.screenID == screen && $0.windowID != window.id }.sorted { $0.start < $1.start }
+        if ordered.count == 3 {
+            ordered.remove(at: column == 0 ? 0 : column == 2 ? 2 : 1)
         }
-        return (column, column + 1)
+        let insertion = column == 0 ? 0 : column == 2 ? ordered.count : ordered.count / 2
+        ordered.insert(Slot(windowID: window.id, start: 0, end: 0, screenID: screen), at: insertion)
+
+        slots.removeAll { $0.screenID == screen || $0.windowID == window.id }
+        if ordered.count == 1 {
+            let range = column == 2 ? (3, 6) : column == 1 ? (1, 5) : (0, 3)
+            slots.append(Slot(windowID: window.id, start: range.0, end: range.1, screenID: screen))
+        } else {
+            let boundaries = ordered.count == 2 ? [0, 3, 6] : [0, 2, 4, 6]
+            for (index, slot) in ordered.enumerated() {
+                slots.append(Slot(windowID: slot.windowID, start: boundaries[index], end: boundaries[index + 1], screenID: screen))
+            }
+        }
+        applyLayout(on: screen)
+        NSLog("Tiles: snapped window %u", window.id)
     }
 
     private func applyLayout(on screen: NSScreen) {
@@ -125,11 +133,17 @@ final class WindowManager {
             pendingSnap = false
         } else {
             pendingSnap = true
+            draggedWindow = focusedWindow()
         }
     }
 
     fileprivate func mouseDragged(at point: CGPoint) {
-        guard let drag = boundaryDrag else { return }
+        guard let drag = boundaryDrag else {
+            // On mouse-down the clicked application may not yet have become
+            // frontmost. Resolve it again once the system starts the drag.
+            draggedWindow = focusedWindow() ?? draggedWindow
+            return
+        }
         let delta = point.x - drag.startX
         let screen = drag.screen
         let unit = screen.visibleFrame.width / 6
@@ -144,15 +158,19 @@ final class WindowManager {
         applyLayout(on: screen)
     }
 
-    fileprivate func mouseUp() {
+    fileprivate func mouseUp(at point: CGPoint) {
         if pendingSnap {
-            let point = NSEvent.mouseLocation
             if let screen = screen(containing: point),
-               (abs(point.x - screen.visibleFrame.minX) < 32 || abs(point.x - screen.visibleFrame.maxX) < 32) {
-                snapFocusedWindow(at: point)
+               (abs(point.x - screen.frame.minX) < 40 || abs(point.x - screen.frame.maxX) < 40) {
+                if let window = draggedWindow ?? focusedWindow() {
+                    snap(window: window, at: point)
+                } else {
+                    NSLog("Tiles: reached an edge but could not identify the dragged window.")
+                }
             }
         }
         pendingSnap = false
+        draggedWindow = nil
         boundaryDrag = nil
     }
 
@@ -208,6 +226,10 @@ final class WindowManager {
     }
 
     private func setFrame(_ frame: CGRect, for id: CGWindowID) {
+        if let item = elements[id] {
+            setFrame(frame, on: item)
+            return
+        }
         guard let app = application(for: id) else { return }
         let axApp = AXUIElementCreateApplication(app.processIdentifier)
         var value: CFTypeRef?
@@ -216,16 +238,28 @@ final class WindowManager {
             var number: CFTypeRef?
             AXUIElementCopyAttributeValue(item, axWindowNumberAttribute as CFString, &number)
             guard (number as? NSNumber)?.uint32Value == id else { continue }
-            let displayHeight = NSScreen.screens.first?.frame.maxY ?? 0
-            var point = CGPoint(x: frame.minX, y: displayHeight - frame.maxY)
-            var size = CGSize(width: frame.width, height: frame.height)
-            AXUIElementSetAttributeValue(item, kAXPositionAttribute as CFString, AXValueCreate(.cgPoint, &point)!)
-            AXUIElementSetAttributeValue(item, kAXSizeAttribute as CFString, AXValueCreate(.cgSize, &size)!)
+            elements[id] = item
+            setFrame(frame, on: item)
             return
         }
     }
 
+    private func setFrame(_ frame: CGRect, on item: AXUIElement) {
+        let displayHeight = NSScreen.screens.first?.frame.maxY ?? 0
+        var point = CGPoint(x: frame.minX, y: displayHeight - frame.maxY)
+        var size = CGSize(width: frame.width, height: frame.height)
+        let positionResult = AXUIElementSetAttributeValue(item, kAXPositionAttribute as CFString, AXValueCreate(.cgPoint, &point)!)
+        let sizeResult = AXUIElementSetAttributeValue(item, kAXSizeAttribute as CFString, AXValueCreate(.cgSize, &size)!)
+        if positionResult != .success || sizeResult != .success {
+            NSLog("Tiles: macOS rejected window movement (%d, %d). Check Accessibility access.", positionResult.rawValue, sizeResult.rawValue)
+        }
+    }
+
     private func frame(of id: CGWindowID) -> CGRect? {
+        if let item = elements[id], let axFrame = axFrame(of: item) {
+            let displayHeight = NSScreen.screens.first?.frame.maxY ?? 0
+            return CGRect(x: axFrame.minX, y: displayHeight - axFrame.maxY, width: axFrame.width, height: axFrame.height)
+        }
         guard let app = application(for: id) else { return nil }
         let axApp = AXUIElementCreateApplication(app.processIdentifier)
         var value: CFTypeRef?
@@ -253,16 +287,10 @@ final class WindowManager {
     }
 
     private func windowExists(_ id: CGWindowID) -> Bool { application(for: id) != nil }
-    private func screen(containing point: CGPoint) -> NSScreen? { NSScreen.screens.first { $0.frame.contains(point) } }
+    private func screen(containing point: CGPoint) -> NSScreen? {
+        NSScreen.screens.first { $0.frame.insetBy(dx: -2, dy: -2).contains(point) }
+    }
     private func requestAccessibility() { if !AXIsProcessTrusted() { _ = AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary) } }
-}
-
-private func eventCallback(_: CGEventTapProxy, type: CGEventType, event: CGEvent, userInfo: UnsafeMutableRawPointer?) -> Unmanaged<CGEvent>? {
-    guard let userInfo else { return Unmanaged.passUnretained(event) }
-    let manager = Unmanaged<WindowManager>.fromOpaque(userInfo).takeUnretainedValue()
-    let point = event.location
-    switch type { case .leftMouseDown: manager.mouseDown(at: point); case .leftMouseDragged: manager.mouseDragged(at: point); case .leftMouseUp: manager.mouseUp(); default: break }
-    return Unmanaged.passUnretained(event)
 }
 
 final class BoundaryOverlay: NSPanel {
@@ -286,8 +314,10 @@ final class GripView: NSView {
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     let manager = WindowManager()
+    private var statusItem: NSStatusItem?
     func applicationDidFinishLaunching(_ notification: Notification) {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        statusItem = item
         item.button?.title = "▦"
         let menu = NSMenu(); menu.addItem(withTitle: "Snap focused window under cursor", action: #selector(snap), keyEquivalent: "s"); menu.addItem(withTitle: "Accessibility status", action: #selector(accessibilityStatus), keyEquivalent: ""); menu.addItem(.separator()); menu.addItem(withTitle: "Quit Tiles", action: #selector(quit), keyEquivalent: "q")
         item.menu = menu
