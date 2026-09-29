@@ -5,6 +5,7 @@ import ServiceManagement
 private let margin: CGFloat = 15
 private let innerMargin = margin / 2
 private let snapDistance: CGFloat = 40
+private let edgeSnapDistance: CGFloat = 60
 // ApplicationServices exposes this attribute at runtime but not in every SDK's Swift overlay.
 private let axWindowNumberAttribute = "AXWindowNumber"
 
@@ -71,7 +72,7 @@ final class WindowManager {
     private func snap(window: (id: CGWindowID, element: AXUIElement), at point: CGPoint) {
         guard let screen = screen(containing: point) else { return }
         elements[window.id] = window.element
-        if abs(point.y - screen.frame.maxY) < 40 {
+        if abs(point.y - screen.frame.maxY) < edgeSnapDistance {
             slots.removeAll { $0.screenID == screen || $0.windowID == window.id }
             slots.append(Slot(windowID: window.id, start: 0, end: 6, screenID: screen))
             applyLayout(on: screen)
@@ -213,7 +214,7 @@ final class WindowManager {
         activeSnapZone = nil
         if pendingSnap {
             if let screen = screen(containing: point),
-               (abs(point.x - screen.frame.minX) < 40 || abs(point.x - screen.frame.maxX) < 40 || abs(point.y - screen.frame.maxY) < 40) {
+               (abs(point.x - screen.frame.minX) < edgeSnapDistance || abs(point.x - screen.frame.maxX) < edgeSnapDistance || abs(point.y - screen.frame.maxY) < edgeSnapDistance) {
                 if let window = draggedWindow ?? focusedWindow() {
                     snap(window: window, at: point)
                 } else {
@@ -254,9 +255,9 @@ final class WindowManager {
             activeSnapZone = nil
             return
         }
-        let nearTop = abs(point.y - screen.frame.maxY) < 60
-        let nearLeft = abs(point.x - screen.frame.minX) < 60
-        let nearRight = abs(point.x - screen.frame.maxX) < 60
+        let nearTop = abs(point.y - screen.frame.maxY) < edgeSnapDistance
+        let nearLeft = abs(point.x - screen.frame.minX) < edgeSnapDistance
+        let nearRight = abs(point.x - screen.frame.maxX) < edgeSnapDistance
         let zone: SnapZone? = nearTop ? .top : nearLeft ? .left : nearRight ? .right : nil
         if zone != activeSnapZone && (zone != nil || activeSnapZone != nil) {
             NSHapticFeedbackManager.defaultPerformer.perform(.alignment, performanceTime: .now)
@@ -341,7 +342,8 @@ final class WindowManager {
     }
 
     private func focusedWindow() -> (id: CGWindowID, element: AXUIElement)? {
-        guard let app = NSWorkspace.shared.frontmostApplication else { return nil }
+        guard let app = NSWorkspace.shared.frontmostApplication,
+              app.processIdentifier != ProcessInfo.processInfo.processIdentifier else { return nil }
         let axApp = AXUIElementCreateApplication(app.processIdentifier)
         var value: CFTypeRef?
         AXUIElementCopyAttributeValue(axApp, kAXFocusedWindowAttribute as CFString, &value)
