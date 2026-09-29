@@ -29,7 +29,7 @@ final class WindowManager {
     private var expected: [CGWindowID: CGRect] = [:]
     private var elements: [CGWindowID: AXUIElement] = [:]
     private var timer: Timer?
-    private var globalMonitor: Any?
+    private var leftMouseWasDown = false
     private var boundaryDrag: (left: CGWindowID, right: CGWindowID, leftFrame: CGRect, rightFrame: CGRect)?
     private var draggedWindow: (id: CGWindowID, element: AXUIElement)?
     private var overlay: BoundaryOverlay?
@@ -48,17 +48,18 @@ final class WindowManager {
         }
         RunLoop.main.add(refreshTimer, forMode: .common)
         timer = refreshTimer
-        globalMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .leftMouseDragged, .leftMouseUp]) { [weak self] event in
-            guard let self else { return }
-            let point = NSEvent.mouseLocation
-            switch event.type {
-            case .leftMouseDown: self.mouseDown(at: point)
-            case .leftMouseDragged: self.mouseDragged(at: point)
-            case .leftMouseUp: self.mouseUp(at: point)
-            default: break
-            }
-        }
         NSLog("Tiles: running. Drag a window to a physical screen edge and release it.")
+    }
+
+    func tileFocusedWindow(start: Int, end: Int) {
+        guard let window = focusedWindow() else {
+            showAccessibilityAlertIfNeeded()
+            return
+        }
+        elements[window.id] = window.element
+        guard let windowFrame = frame(of: window.id),
+              let screen = NSScreen.screens.first(where: { $0.frame.intersects(windowFrame) }) ?? NSScreen.main else { return }
+        applyPaletteLayout(to: window, start: start, end: end, screen: screen)
     }
 
     func snapFocusedWindow(at point: CGPoint) {
@@ -117,6 +118,7 @@ final class WindowManager {
     }
 
     private func reconcileAndShowBoundary() {
+        pollMouse()
         slots = slots.filter { windowExists($0.windowID) }
         syncLinkedResize()
         if pendingSnap && boundaryDrag == nil {
@@ -147,6 +149,21 @@ final class WindowManager {
             NSCursor.arrow.set()
             cursorIsResizing = false
         }
+    }
+
+    private func pollMouse() {
+        let isDown = CGEventSource.buttonState(.combinedSessionState, button: .left)
+        let point = NSEvent.mouseLocation
+        if isDown {
+            if !leftMouseWasDown {
+                mouseDown(at: point)
+            } else {
+                mouseDragged(at: point)
+            }
+        } else if leftMouseWasDown {
+            mouseUp(at: point)
+        }
+        leftMouseWasDown = isDown
     }
 
     private func syncLinkedResize() {
@@ -446,6 +463,13 @@ final class WindowManager {
         NSScreen.screens.first { $0.frame.insetBy(dx: -2, dy: -2).contains(point) }
     }
     private func requestAccessibility() { if !AXIsProcessTrusted() { _ = AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary) } }
+    private func showAccessibilityAlertIfNeeded() {
+        guard !AXIsProcessTrusted() else { return }
+        let alert = NSAlert()
+        alert.messageText = "Tiles needs Accessibility access"
+        alert.informativeText = "Enable Tiles in System Settings → Privacy & Security → Accessibility, then relaunch Tiles."
+        alert.runModal()
+    }
 }
 
 final class BoundaryOverlay: NSPanel {
@@ -667,7 +691,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         launchItem.target = self
         launchAtStartupItem = launchItem
         menu.addItem(.separator())
-        let snapItem = menu.addItem(withTitle: "Snap focused window under cursor", action: #selector(snap), keyEquivalent: "s")
+        let tileItem = NSMenuItem(title: "Tile focused window", action: nil, keyEquivalent: "")
+        let tileMenu = NSMenu(title: "Tile focused window")
+        for option in [("Left half", 0, 3), ("Full screen", 0, 6), ("Right half", 3, 6),
+                       ("Left third", 0, 2), ("Center third", 2, 4), ("Right third", 4, 6)] {
+            let optionItem = tileMenu.addItem(withTitle: option.0, action: #selector(tileFromMenu(_:)), keyEquivalent: "")
+            optionItem.target = self
+            optionItem.tag = option.1 * 10 + option.2
+        }
+        tileItem.submenu = tileMenu
+        menu.addItem(tileItem)
+        let snapItem = menu.addItem(withTitle: "Snap focused window under cursor", action: #selector(snap), keyEquivalent: "")
         snapItem.target = self
         let accessibilityItem = menu.addItem(withTitle: "Accessibility status", action: #selector(accessibilityStatus), keyEquivalent: "")
         accessibilityItem.target = self
@@ -679,6 +713,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         manager.start()
     }
     func menuWillOpen(_ menu: NSMenu) { updateLaunchAtStartupItem() }
+    @objc private func tileFromMenu(_ sender: NSMenuItem) {
+        manager.tileFocusedWindow(start: sender.tag / 10, end: sender.tag % 10)
+    }
     @objc private func toggleLaunchAtStartup() {
         do {
             if SMAppService.mainApp.status == .enabled {
