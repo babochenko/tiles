@@ -2,6 +2,7 @@ import AppKit
 import ApplicationServices
 
 private let margin: CGFloat = 15
+private let innerMargin = margin / 2
 private let snapDistance: CGFloat = 40
 // ApplicationServices exposes this attribute at runtime but not in every SDK's Swift overlay.
 private let axWindowNumberAttribute = "AXWindowNumber"
@@ -59,6 +60,13 @@ final class WindowManager {
     private func snap(window: (id: CGWindowID, element: AXUIElement), at point: CGPoint) {
         guard let screen = screen(containing: point) else { return }
         elements[window.id] = window.element
+        if abs(point.y - screen.frame.maxY) < 40 {
+            slots.removeAll { $0.screenID == screen || $0.windowID == window.id }
+            slots.append(Slot(windowID: window.id, start: 0, end: 6, screenID: screen))
+            applyLayout(on: screen)
+            NSLog("Tiles: maximized window %u", window.id)
+            return
+        }
         let column = min(2, max(0, Int((point.x - screen.visibleFrame.minX) / (screen.visibleFrame.width / 3))))
         var ordered = slots.filter { $0.screenID == screen && $0.windowID != window.id }.sorted { $0.start < $1.start }
         if ordered.count == 3 {
@@ -85,9 +93,11 @@ final class WindowManager {
         let screenSlots = slots.filter { $0.screenID == screen }
         let unit = screen.visibleFrame.width / 6
         for slot in screenSlots {
-            let frame = CGRect(x: screen.visibleFrame.minX + CGFloat(slot.start) * unit + margin,
+            let leftInset = slot.start == 0 ? margin : innerMargin
+            let rightInset = slot.end == 6 ? margin : innerMargin
+            let frame = CGRect(x: screen.visibleFrame.minX + CGFloat(slot.start) * unit + leftInset,
                                y: screen.visibleFrame.minY + margin,
-                               width: CGFloat(slot.end - slot.start) * unit - margin * 2,
+                               width: CGFloat(slot.end - slot.start) * unit - leftInset - rightInset,
                                height: screen.visibleFrame.height - margin * 2)
             setFrame(frame, for: slot.windowID)
             expected[slot.windowID] = frame
@@ -131,13 +141,13 @@ final class WindowManager {
 
                 if leftChanged && abs(leftFrame.maxX - rightFrame.minX) <= snapDistance {
                     var linkedRight = rightFrame
-                    linkedRight.origin.x = leftFrame.maxX + margin * 2
+                    linkedRight.origin.x = leftFrame.maxX + margin
                     linkedRight.size.width = max(100, rightFrame.maxX - linkedRight.minX)
                     setFrame(linkedRight, for: right.windowID)
                     expected[left.windowID] = leftFrame; expected[right.windowID] = linkedRight
                 } else if rightChanged && abs(rightFrame.minX - leftFrame.maxX) <= snapDistance {
                     var linkedLeft = leftFrame
-                    linkedLeft.size.width = max(100, rightFrame.minX - margin * 2 - leftFrame.minX)
+                    linkedLeft.size.width = max(100, rightFrame.minX - margin - leftFrame.minX)
                     setFrame(linkedLeft, for: left.windowID)
                     expected[left.windowID] = linkedLeft; expected[right.windowID] = rightFrame
                 }
@@ -167,11 +177,11 @@ final class WindowManager {
             updatePreview(at: point)
             return
         }
-        let divider = min(drag.rightFrame.maxX - 100 - margin, max(drag.leftFrame.minX + 100 + margin, point.x))
+        let divider = min(drag.rightFrame.maxX - 100 - innerMargin, max(drag.leftFrame.minX + 100 + innerMargin, point.x))
         var leftFrame = drag.leftFrame
         var rightFrame = drag.rightFrame
-        leftFrame.size.width = divider - margin - leftFrame.minX
-        rightFrame.origin.x = divider + margin
+        leftFrame.size.width = divider - innerMargin - leftFrame.minX
+        rightFrame.origin.x = divider + innerMargin
         rightFrame.size.width = drag.rightFrame.maxX - rightFrame.minX
         setFrame(leftFrame, for: drag.left); setFrame(rightFrame, for: drag.right)
         expected[drag.left] = leftFrame; expected[drag.right] = rightFrame
@@ -182,7 +192,7 @@ final class WindowManager {
         preview = nil
         if pendingSnap {
             if let screen = screen(containing: point),
-               (abs(point.x - screen.frame.minX) < 40 || abs(point.x - screen.frame.maxX) < 40) {
+               (abs(point.x - screen.frame.minX) < 40 || abs(point.x - screen.frame.maxX) < 40 || abs(point.y - screen.frame.maxY) < 40) {
                 if let window = draggedWindow ?? focusedWindow() {
                     snap(window: window, at: point)
                 } else {
@@ -217,17 +227,34 @@ final class WindowManager {
     }
 
     private func updatePreview(at point: CGPoint) {
-        guard let screen = screen(containing: point),
-              abs(point.x - screen.frame.minX) < 60 || abs(point.x - screen.frame.maxX) < 60 else {
+        guard let screen = screen(containing: point) else {
             preview?.close(); preview = nil
             return
         }
-        let count = min(3, slots.filter { $0.screenID == screen && $0.windowID != draggedWindow?.id }.count + 1)
-        let isLeft = abs(point.x - screen.frame.minX) < abs(point.x - screen.frame.maxX)
-        let width = count == 1 ? screen.visibleFrame.width / 2 : screen.visibleFrame.width / CGFloat(count)
-        let x = isLeft ? screen.visibleFrame.minX + margin : screen.visibleFrame.maxX - width + margin
-        let target = CGRect(x: x, y: screen.visibleFrame.minY + margin,
-                            width: width - margin * 2, height: screen.visibleFrame.height - margin * 2)
+        let nearTop = abs(point.y - screen.frame.maxY) < 60
+        let nearLeft = abs(point.x - screen.frame.minX) < 60
+        let nearRight = abs(point.x - screen.frame.maxX) < 60
+        guard nearTop || nearLeft || nearRight else {
+            preview?.close(); preview = nil
+            return
+        }
+
+        let target: CGRect
+        if nearTop {
+            target = screen.visibleFrame.insetBy(dx: margin, dy: margin)
+        } else {
+            let existingCount = slots.filter { $0.screenID == screen && $0.windowID != draggedWindow?.id }.count
+            let columns = max(2, min(3, existingCount + 1))
+            let isLeft = nearLeft
+            let index = isLeft ? 0 : columns - 1
+            let columnWidth = screen.visibleFrame.width / CGFloat(columns)
+            let leftInset = index == 0 ? margin : innerMargin
+            let rightInset = index == columns - 1 ? margin : innerMargin
+            target = CGRect(x: screen.visibleFrame.minX + CGFloat(index) * columnWidth + leftInset,
+                            y: screen.visibleFrame.minY + margin,
+                            width: columnWidth - leftInset - rightInset,
+                            height: screen.visibleFrame.height - margin * 2)
+        }
         if preview == nil { preview = SnapPreviewPanel() }
         preview?.show(frame: target)
     }
@@ -351,21 +378,29 @@ final class SnapPreviewPanel: NSPanel {
     init() {
         super.init(contentRect: .zero, styleMask: .borderless, backing: .buffered, defer: false)
         isFloatingPanel = true
-        level = .floating
+        level = .screenSaver
         isOpaque = false
-        backgroundColor = NSColor.controlAccentColor.withAlphaComponent(0.22)
+        backgroundColor = .clear
         ignoresMouseEvents = true
         hasShadow = false
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-        contentView?.wantsLayer = true
-        contentView?.layer?.cornerRadius = 10
-        contentView?.layer?.borderWidth = 2
-        contentView?.layer?.borderColor = NSColor.controlAccentColor.withAlphaComponent(0.8).cgColor
+        contentView = SnapPreviewView()
     }
 
     func show(frame: CGRect) {
         setFrame(frame, display: true)
         orderFrontRegardless()
+    }
+}
+
+final class SnapPreviewView: NSView {
+    override func draw(_ dirtyRect: NSRect) {
+        let path = NSBezierPath(roundedRect: bounds.insetBy(dx: 1, dy: 1), xRadius: 10, yRadius: 10)
+        NSColor.controlAccentColor.withAlphaComponent(0.24).setFill()
+        path.fill()
+        path.lineWidth = 2
+        NSColor.controlAccentColor.withAlphaComponent(0.9).setStroke()
+        path.stroke()
     }
 }
 
