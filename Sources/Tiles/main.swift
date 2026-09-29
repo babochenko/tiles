@@ -38,6 +38,9 @@ final class WindowManager {
         eventTap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap,
                                      options: .listenOnly, eventsOfInterest: mask, callback: eventCallback,
                                      userInfo: context)
+        if eventTap == nil {
+            NSLog("Tiles: could not create the global mouse event tap. Enable Accessibility access for Tiles or Terminal.")
+        }
         if let eventTap {
             let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, eventTap, 0)
             CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
@@ -171,7 +174,33 @@ final class WindowManager {
         let window = value as! AXUIElement
         var number: CFTypeRef?
         AXUIElementCopyAttributeValue(window, axWindowNumberAttribute as CFString, &number)
-        return (number as? NSNumber).map { (CGWindowID($0.uint32Value), window) }
+        if let number = number as? NSNumber { return (CGWindowID(number.uint32Value), window) }
+
+        // AXWindowNumber is not exported by all macOS SDKs and is absent for
+        // some applications. Match the focused AX window to its CG window by
+        // PID and bounds instead of silently making snapping a no-op.
+        let pid = app.processIdentifier
+        guard let axFrame = axFrame(of: window) else { return nil }
+        let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
+        for info in windows where (info[kCGWindowOwnerPID as String] as? pid_t) == pid {
+            guard let bounds = info[kCGWindowBounds as String] as? NSDictionary,
+                  let number = info[kCGWindowNumber as String] as? NSNumber else { continue }
+            var cgFrame = CGRect.zero
+            guard CGRectMakeWithDictionaryRepresentation(bounds, &cgFrame), abs(cgFrame.width - axFrame.width) < 3,
+                  abs(cgFrame.height - axFrame.height) < 3 else { continue }
+            return (CGWindowID(number.uint32Value), window)
+        }
+        return nil
+    }
+
+    private func axFrame(of window: AXUIElement) -> CGRect? {
+        var position: CFTypeRef?; var size: CFTypeRef?
+        AXUIElementCopyAttributeValue(window, kAXPositionAttribute as CFString, &position)
+        AXUIElementCopyAttributeValue(window, kAXSizeAttribute as CFString, &size)
+        guard let position, let size else { return nil }
+        var point = CGPoint.zero; var dimensions = CGSize.zero
+        guard AXValueGetValue(position as! AXValue, .cgPoint, &point), AXValueGetValue(size as! AXValue, .cgSize, &dimensions) else { return nil }
+        return CGRect(origin: point, size: dimensions)
     }
 
     private func setFrame(_ frame: CGRect, for id: CGWindowID) {
