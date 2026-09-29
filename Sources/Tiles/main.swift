@@ -159,7 +159,9 @@ final class WindowManager {
         if isDown {
             if !leftMouseWasDown {
                 let inMenuBar = screen(containing: point).map { point.y >= $0.visibleFrame.maxY } ?? false
-                let inTilesWindow = NSApp.windows.contains { $0.isVisible && $0.frame.contains(point) }
+                let inTilesWindow = NSApp.windows.contains {
+                    $0.isVisible && !$0.ignoresMouseEvents && $0.frame.contains(point)
+                }
                 ignoringMouseSequence = inMenuBar || inTilesWindow
                 if !ignoringMouseSequence { mouseDown(at: point) }
             } else if !ignoringMouseSequence {
