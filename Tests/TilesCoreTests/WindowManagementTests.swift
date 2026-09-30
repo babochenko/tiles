@@ -191,6 +191,98 @@ final class AutoTileGeometryTests: XCTestCase {
     }
 }
 
+final class CoupledDragGeometryTests: XCTestCase {
+    private let left = CGRect(x: 0, y: 20, width: 300, height: 600)
+    private let right = CGRect(x: 315, y: 20, width: 300, height: 600)
+    private let initialDivider: CGFloat = 307.5
+
+    func testGrowingLeftShrinksRightBeforeGrowingLeft() throws {
+        let plan = try XCTUnwrap(CoupledDragGeometry.plan(
+            left: left, right: right, requestedDivider: 400, previousDivider: initialDivider,
+            leftMinimumWidth: 100, rightMinimumWidth: 100
+        ))
+        XCTAssertEqual(plan.writeOrder, .rightThenLeft)
+        XCTAssertEqual(plan.left.maxX, 392.5)
+        XCTAssertEqual(plan.right.minX, 407.5)
+        XCTAssertEqual(plan.right.minX - plan.left.maxX, 15)
+    }
+
+    func testGrowingRightShrinksLeftBeforeGrowingRight() throws {
+        let plan = try XCTUnwrap(CoupledDragGeometry.plan(
+            left: left, right: right, requestedDivider: 200, previousDivider: initialDivider,
+            leftMinimumWidth: 100, rightMinimumWidth: 100
+        ))
+        XCTAssertEqual(plan.writeOrder, .leftThenRight)
+        XCTAssertEqual(plan.left.maxX, 192.5)
+        XCTAssertEqual(plan.right.minX, 207.5)
+    }
+
+    func testReportedMinimumWidthsClampBothDividerExtremes() throws {
+        let farLeft = try XCTUnwrap(CoupledDragGeometry.plan(
+            left: left, right: right, requestedDivider: -100, previousDivider: initialDivider,
+            leftMinimumWidth: 140, rightMinimumWidth: 180
+        ))
+        XCTAssertEqual(farLeft.left.width, 140)
+
+        let farRight = try XCTUnwrap(CoupledDragGeometry.plan(
+            left: left, right: right, requestedDivider: 1000, previousDivider: initialDivider,
+            leftMinimumWidth: 140, rightMinimumWidth: 180
+        ))
+        XCTAssertEqual(farRight.right.width, 180)
+    }
+
+    func testLegalRangeIncludesHalfGapAroundMinimumWidths() {
+        XCTAssertEqual(CoupledDragGeometry.legalDividerRange(
+            left: left, right: right, leftMinimumWidth: 100, rightMinimumWidth: 150
+        ), 107.5...457.5)
+    }
+
+    func testImpossibleMinimumWidthsProduceNoPlan() {
+        let narrowRight = CGRect(x: 115, y: 20, width: 85, height: 600)
+        XCTAssertNil(CoupledDragGeometry.plan(
+            left: CGRect(x: 0, y: 20, width: 100, height: 600), right: narrowRight,
+            requestedDivider: 100, previousDivider: 100,
+            leftMinimumWidth: 100, rightMinimumWidth: 100
+        ))
+    }
+
+    func testAcceptedFramesNeedNoReleaseCorrection() {
+        XCTAssertNil(CoupledDragGeometry.correctionDivider(
+            desiredDivider: 400,
+            actualLeft: CGRect(x: 0, y: 20, width: 392.5, height: 600),
+            actualRight: CGRect(x: 407.5, y: 20, width: 207.5, height: 600),
+            legalRange: 107.5...507.5
+        ))
+    }
+
+    func testReleaseCorrectionUsesTheWindowThatRejectedItsFrame() {
+        let expectedRight = CGRect(x: 407.5, y: 20, width: 207.5, height: 600)
+        XCTAssertEqual(CoupledDragGeometry.correctionDivider(
+            desiredDivider: 400,
+            actualLeft: CGRect(x: 0, y: 20, width: 350, height: 600),
+            actualRight: expectedRight,
+            legalRange: 107.5...507.5
+        ), 357.5)
+
+        let expectedLeft = CGRect(x: 0, y: 20, width: 392.5, height: 600)
+        XCTAssertEqual(CoupledDragGeometry.correctionDivider(
+            desiredDivider: 400,
+            actualLeft: expectedLeft,
+            actualRight: CGRect(x: 450, y: 20, width: 165, height: 600),
+            legalRange: 107.5...507.5
+        ), 442.5)
+    }
+
+    func testReleaseCorrectionAveragesTwoRejectedEdgesAndClampsToLegalRange() {
+        XCTAssertEqual(CoupledDragGeometry.correctionDivider(
+            desiredDivider: 400,
+            actualLeft: CGRect(x: 0, y: 20, width: 0, height: 600),
+            actualRight: CGRect(x: 700, y: 20, width: 100, height: 600),
+            legalRange: 107.5...300
+        ), 300)
+    }
+}
+
 final class LinkedResizeGeometryTests: XCTestCase {
     private let expectedLeft = CGRect(x: 0, y: 10, width: 100, height: 500)
     private let expectedRight = CGRect(x: 115, y: 10, width: 100, height: 500)

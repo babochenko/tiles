@@ -7,7 +7,19 @@ private let margin = TilingGeometry.margin
 private let snapDistance: CGFloat = 40
 // ApplicationServices exposes this attribute at runtime but not in every SDK's Swift overlay.
 private let axWindowNumberAttribute = "AXWindowNumber"
+private let axMinimumSizeAttribute = "AXMinSize"
 private typealias Slot = PlacedSlot<NSScreen>
+
+private struct BoundaryDrag {
+    let left: CGWindowID
+    let right: CGWindowID
+    let leftFrame: CGRect
+    let rightFrame: CGRect
+    let leftMinimumWidth: CGFloat
+    let rightMinimumWidth: CGFloat
+    let legalDividerRange: ClosedRange<CGFloat>
+    var lastDivider: CGFloat
+}
 
 final class WindowManager {
     private var slots: [Slot] = []
@@ -15,7 +27,8 @@ final class WindowManager {
     private var elements: [CGWindowID: AXUIElement] = [:]
     private var timer: Timer?
     private var mouseSequenceGate = MouseSequenceGate()
-    private var boundaryDrag: (left: CGWindowID, right: CGWindowID, leftFrame: CGRect, rightFrame: CGRect)?
+    private var boundaryDrag: BoundaryDrag?
+    private var boundarySettlePending = false
     private var draggedWindow: (id: CGWindowID, element: AXUIElement)?
     private var lastExternalWindow: (id: CGWindowID, element: AXUIElement)?
     private var overlay: BoundaryOverlay?
@@ -138,7 +151,7 @@ final class WindowManager {
         pollMouse()
         // Boundary dragging is the latency-sensitive path. Avoid AX reads,
         // CGWindow scans, and overlay work after writing both window frames.
-        guard boundaryDrag == nil else { return }
+        guard boundaryDrag == nil, !boundarySettlePending else { return }
         if Date().timeIntervalSince(lastSlotCleanup) >= 1 {
             lastSlotCleanup = Date()
             slots = slots.filter { windowExists($0.windowID) }
@@ -233,7 +246,7 @@ final class WindowManager {
     }
 
     fileprivate func mouseDragged(at point: CGPoint) {
-        guard let drag = boundaryDrag else {
+        guard var drag = boundaryDrag else {
             guard snapDragGesture.mouseDragged(to: point) else { return }
             // On mouse-down the clicked application may not yet have become
             // frontmost. Resolve it again once the system starts the drag.
@@ -241,12 +254,29 @@ final class WindowManager {
             updatePreview(at: point)
             return
         }
-        let frames = TilingGeometry.linkedFrames(left: drag.leftFrame, right: drag.rightFrame, divider: point.x)
-        setFrame(frames.left, for: drag.left); setFrame(frames.right, for: drag.right)
-        expected[drag.left] = frames.left; expected[drag.right] = frames.right
+        guard let plan = CoupledDragGeometry.plan(
+            left: drag.leftFrame,
+            right: drag.rightFrame,
+            requestedDivider: point.x,
+            previousDivider: drag.lastDivider,
+            leftMinimumWidth: drag.leftMinimumWidth,
+            rightMinimumWidth: drag.rightMinimumWidth
+        ), abs(plan.divider - drag.lastDivider) >= 0.01 else { return }
+        applyCoupledDragPlan(plan, left: drag.left, right: drag.right)
+        expected[drag.left] = plan.left
+        expected[drag.right] = plan.right
+        drag.lastDivider = plan.divider
+        boundaryDrag = drag
     }
 
     fileprivate func mouseUp(at point: CGPoint) {
+        if let boundaryDrag {
+            boundarySettlePending = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+                self?.settleBoundaryDrag(boundaryDrag)
+                self?.boundarySettlePending = false
+            }
+        }
         preview?.close()
         preview = nil
         layoutWidget?.close()
@@ -268,7 +298,7 @@ final class WindowManager {
         if cursorIsResizing { NSCursor.arrow.set(); cursorIsResizing = false }
     }
 
-    private func boundaryAt(_ point: CGPoint) -> (left: CGWindowID, right: CGWindowID, leftFrame: CGRect, rightFrame: CGRect)? {
+    private func boundaryAt(_ point: CGPoint) -> BoundaryDrag? {
         for screen in NSScreen.screens {
             for boundary in 1..<6 {
                 guard let left = slots.first(where: { $0.screenID == screen && $0.end == boundary }),
@@ -276,11 +306,58 @@ final class WindowManager {
                       let leftFrame = frame(of: left.windowID), let rightFrame = frame(of: right.windowID) else { continue }
                 let x = BoundaryGeometry.dividerX(left: leftFrame, right: rightFrame)
                 if BoundaryGeometry.isHit(pointX: point.x, dividerX: x, distance: snapDistance) {
-                    return (left.windowID, right.windowID, leftFrame, rightFrame)
+                    let leftMinimumWidth = minimumWidth(for: left.windowID)
+                    let rightMinimumWidth = minimumWidth(for: right.windowID)
+                    guard let legalDividerRange = CoupledDragGeometry.legalDividerRange(
+                        left: leftFrame,
+                        right: rightFrame,
+                        leftMinimumWidth: leftMinimumWidth,
+                        rightMinimumWidth: rightMinimumWidth
+                    ) else { continue }
+                    return BoundaryDrag(
+                        left: left.windowID,
+                        right: right.windowID,
+                        leftFrame: leftFrame,
+                        rightFrame: rightFrame,
+                        leftMinimumWidth: leftMinimumWidth,
+                        rightMinimumWidth: rightMinimumWidth,
+                        legalDividerRange: legalDividerRange,
+                        lastDivider: x
+                    )
                 }
             }
         }
         return nil
+    }
+
+    private func applyCoupledDragPlan(_ plan: CoupledDragPlan, left: CGWindowID, right: CGWindowID) {
+        if plan.writeOrder == .rightThenLeft {
+            setFrame(plan.right, for: right)
+            setFrame(plan.left, for: left)
+        } else {
+            setFrame(plan.left, for: left)
+            setFrame(plan.right, for: right)
+        }
+    }
+
+    private func settleBoundaryDrag(_ drag: BoundaryDrag) {
+        guard let actualLeft = frame(of: drag.left), let actualRight = frame(of: drag.right),
+              let divider = CoupledDragGeometry.correctionDivider(
+                  desiredDivider: drag.lastDivider,
+                  actualLeft: actualLeft,
+                  actualRight: actualRight,
+                  legalRange: drag.legalDividerRange
+              ), let plan = CoupledDragGeometry.plan(
+                  left: drag.leftFrame,
+                  right: drag.rightFrame,
+                  requestedDivider: divider,
+                  previousDivider: drag.lastDivider,
+                  leftMinimumWidth: drag.leftMinimumWidth,
+                  rightMinimumWidth: drag.rightMinimumWidth
+              ) else { return }
+        applyCoupledDragPlan(plan, left: drag.left, right: drag.right)
+        expected[drag.left] = plan.left
+        expected[drag.right] = plan.right
     }
 
     private func boundaryX(on screen: NSScreen, at boundary: Int) -> CGFloat? {
@@ -441,6 +518,16 @@ final class WindowManager {
         var point = CGPoint.zero; var dimensions = CGSize.zero
         guard AXValueGetValue(position as! AXValue, .cgPoint, &point), AXValueGetValue(size as! AXValue, .cgSize, &dimensions) else { return nil }
         return CGRect(origin: point, size: dimensions)
+    }
+
+    private func minimumWidth(for id: CGWindowID) -> CGFloat {
+        guard let item = elements[id] else { return 100 }
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(item, axMinimumSizeAttribute as CFString, &value) == .success,
+              let value, CFGetTypeID(value) == AXValueGetTypeID() else { return 100 }
+        var size = CGSize.zero
+        guard AXValueGetValue(value as! AXValue, .cgSize, &size), size.width > 0 else { return 100 }
+        return size.width
     }
 
     private func setFrame(_ frame: CGRect, for id: CGWindowID) {

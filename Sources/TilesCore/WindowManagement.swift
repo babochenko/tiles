@@ -143,6 +143,90 @@ public enum LinkedResizeSource: Equatable {
     case right
 }
 
+public enum WindowFrameWriteOrder: Equatable {
+    case leftThenRight
+    case rightThenLeft
+}
+
+public struct CoupledDragPlan: Equatable {
+    public let divider: CGFloat
+    public let left: CGRect
+    public let right: CGRect
+    public let writeOrder: WindowFrameWriteOrder
+
+    public init(divider: CGFloat, left: CGRect, right: CGRect, writeOrder: WindowFrameWriteOrder) {
+        self.divider = divider
+        self.left = left
+        self.right = right
+        self.writeOrder = writeOrder
+    }
+}
+
+public enum CoupledDragGeometry {
+    public static func plan(
+        left: CGRect,
+        right: CGRect,
+        requestedDivider: CGFloat,
+        previousDivider: CGFloat,
+        leftMinimumWidth: CGFloat,
+        rightMinimumWidth: CGFloat,
+        gap: CGFloat = TilingGeometry.margin
+    ) -> CoupledDragPlan? {
+        let halfGap = gap / 2
+        let minimumDivider = left.minX + leftMinimumWidth + halfGap
+        let maximumDivider = right.maxX - rightMinimumWidth - halfGap
+        guard minimumDivider <= maximumDivider else { return nil }
+        let divider = min(maximumDivider, max(minimumDivider, requestedDivider))
+        var newLeft = left
+        var newRight = right
+        newLeft.size.width = divider - halfGap - left.minX
+        newRight.origin.x = divider + halfGap
+        newRight.size.width = right.maxX - newRight.minX
+        let writeOrder: WindowFrameWriteOrder = divider > previousDivider ? .rightThenLeft : .leftThenRight
+        return CoupledDragPlan(divider: divider, left: newLeft, right: newRight, writeOrder: writeOrder)
+    }
+
+    public static func correctionDivider(
+        desiredDivider: CGFloat,
+        actualLeft: CGRect,
+        actualRight: CGRect,
+        legalRange: ClosedRange<CGFloat>,
+        gap: CGFloat = TilingGeometry.margin,
+        tolerance: CGFloat = 1.5
+    ) -> CGFloat? {
+        let halfGap = gap / 2
+        let leftDivider = actualLeft.maxX + halfGap
+        let rightDivider = actualRight.minX - halfGap
+        let leftRejected = abs(leftDivider - desiredDivider) > tolerance
+        let rightRejected = abs(rightDivider - desiredDivider) > tolerance
+        guard leftRejected || rightRejected else { return nil }
+
+        let correction: CGFloat
+        if leftRejected && rightRejected {
+            correction = (leftDivider + rightDivider) / 2
+        } else if leftRejected {
+            correction = leftDivider
+        } else {
+            correction = rightDivider
+        }
+        return min(legalRange.upperBound, max(legalRange.lowerBound, correction))
+    }
+
+    public static func legalDividerRange(
+        left: CGRect,
+        right: CGRect,
+        leftMinimumWidth: CGFloat,
+        rightMinimumWidth: CGFloat,
+        gap: CGFloat = TilingGeometry.margin
+    ) -> ClosedRange<CGFloat>? {
+        let halfGap = gap / 2
+        let lowerBound = left.minX + leftMinimumWidth + halfGap
+        let upperBound = right.maxX - rightMinimumWidth - halfGap
+        guard lowerBound <= upperBound else { return nil }
+        return lowerBound...upperBound
+    }
+}
+
 public struct LinkedResizeUpdate: Equatable {
     public let source: LinkedResizeSource
     public let left: CGRect
