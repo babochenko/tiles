@@ -8,7 +8,14 @@ private let snapDistance: CGFloat = 40
 // ApplicationServices exposes this attribute at runtime but not in every SDK's Swift overlay.
 private let axWindowNumberAttribute = "AXWindowNumber"
 private let axMinimumSizeAttribute = "AXMinSize"
-private typealias Slot = PlacedSlot<NSScreen>
+private typealias DisplayID = UInt32
+
+private struct VisibleRuntimeWindow {
+    let identity: WindowIdentity
+    let frame: CGRect
+    let element: AXUIElement
+    let screenID: DisplayID
+}
 
 private struct BoundaryDrag {
     let left: CGWindowID
@@ -18,11 +25,14 @@ private struct BoundaryDrag {
     let leftMinimumWidth: CGFloat
     let rightMinimumWidth: CGFloat
     let legalDividerRange: ClosedRange<CGFloat>
+    let context: StageGroupContext<DisplayID>
     var lastDivider: CGFloat
 }
 
 final class WindowManager {
-    private var slots: [Slot] = []
+    private var stageGroups = StageGroupStore<DisplayID>()
+    private var visibleWindows: [WindowIdentity: VisibleRuntimeWindow] = [:]
+    private var visibleWindowOrder: [WindowIdentity] = []
     private var expected: [CGWindowID: CGRect] = [:]
     private var elements: [CGWindowID: AXUIElement] = [:]
     private var timer: Timer?
@@ -31,7 +41,6 @@ final class WindowManager {
     private var boundaryDrag: BoundaryDrag?
     private var boundarySettlePending = false
     private var draggedWindow: (id: CGWindowID, element: AXUIElement)?
-    private var lastExternalWindow: (id: CGWindowID, element: AXUIElement)?
     private var overlay: BoundaryOverlay?
     private var preview: SnapPreviewPanel?
     private var previewScreen: NSScreen?
@@ -42,7 +51,6 @@ final class WindowManager {
     private var cursorIsResizing = false
     private var activeSnapZone: SnapZone?
     private var lastZoomCheck = Date.distantPast
-    private var lastSlotCleanup = Date.distantPast
     private var pendingSnap = false
     private var snapDragGesture = SnapDragGesture()
 
@@ -70,70 +78,53 @@ final class WindowManager {
     }
 
     func tileFocusedWindow(start: Int, end: Int) {
-        guard let window = focusedWindow() ?? lastExternalWindow else {
+        refreshVisibleGroups()
+        guard let window = focusedWindow() else {
             showAccessibilityAlertIfNeeded()
             return
         }
         elements[window.id] = window.element
         let screens = NSScreen.screens
-        let fallbackIndex = NSScreen.main.flatMap { main in screens.firstIndex(of: main) }
         guard let windowFrame = frame(of: window.id),
               let screenIndex = ScreenGeometry.index(
                   intersecting: windowFrame,
                   frames: screens.map(\.frame),
-                  fallbackIndex: fallbackIndex
+                  fallbackIndex: nil
               ) else { return }
         let screen = screens[screenIndex]
         applyPaletteLayout(to: window, start: start, end: end, screen: screen)
     }
 
     func tileVisibleWindows() {
+        refreshVisibleGroups()
         let screens = NSScreen.screens
-        let displayHeight = screens.first?.frame.maxY ?? 0
-        let ownPID = ProcessInfo.processInfo.processIdentifier
-        let windowInfo = CGWindowListCopyWindowInfo(
-            [.optionOnScreenOnly, .excludeDesktopElements],
-            kCGNullWindowID
-        ) as? [[String: Any]] ?? []
-        var candidates: [VisibleWindowGeometry] = []
-
-        for info in windowInfo {
-            guard (info[kCGWindowLayer as String] as? NSNumber)?.intValue == 0,
-                  (info[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value != ownPID,
-                  (info[kCGWindowAlpha as String] as? NSNumber)?.doubleValue ?? 1 > 0,
-                  let number = info[kCGWindowNumber as String] as? NSNumber,
-                  let bounds = info[kCGWindowBounds as String] as? NSDictionary else { continue }
-            var quartzFrame = CGRect.zero
-            guard CGRectMakeWithDictionaryRepresentation(bounds, &quartzFrame) else { continue }
-            let frame = CoordinateGeometry.flipVertically(quartzFrame, displayHeight: displayHeight)
-            let windowID = CGWindowID(number.uint32Value)
-            guard let pid = info[kCGWindowOwnerPID as String] as? pid_t,
-                  let element = visibleWindowElement(for: windowID, pid: pid, expectedFrame: frame) else { continue }
-            elements[windowID] = element
-            candidates.append(VisibleWindowGeometry(windowID: windowID, frame: frame))
+        var tiledCount = 0
+        for screen in screens {
+            let id = displayID(for: screen)
+            guard let context = stageGroups.activeContext(on: id) else { continue }
+            let candidates = visibleWindowOrder.compactMap { visibleWindows[$0] }
+                .filter { $0.screenID == id && context.visibleWindows.contains($0.identity) }
+                .map { VisibleWindowGeometry(windowID: $0.identity.windowID, frame: $0.frame) }
+            let placements = AutoTileGeometry.placements(for: candidates, screenFrames: [screen.frame])
+            let newSlots = placements.map {
+                LayoutSlot(windowID: $0.windowID, start: $0.start, end: $0.end)
+            }
+            guard !newSlots.isEmpty else { continue }
+            stageGroups.setSlots(newSlots, in: context)
+            applyLayout(in: context, on: screen)
+            tiledCount += newSlots.count
         }
-
-        let placements = AutoTileGeometry.placements(for: candidates, screenFrames: screens.map(\.frame))
-        guard !placements.isEmpty else {
+        guard tiledCount > 0 else {
             NSLog("Tiles: no visible standard windows found to tile.")
             return
         }
-        let affectedScreenIndices = Set(placements.map(\.screenID))
-        let affectedScreens = Set(affectedScreenIndices.map { screens[$0] })
-        let selectedWindowIDs = Set(placements.map(\.windowID))
-        slots.removeAll { affectedScreens.contains($0.screenID) || selectedWindowIDs.contains($0.windowID) }
-        slots += placements.map {
-            Slot(windowID: $0.windowID, start: $0.start, end: $0.end, screenID: screens[$0.screenID])
-        }
-        for screenIndex in affectedScreenIndices {
-            applyLayout(on: screens[screenIndex])
-        }
         NSHapticFeedbackManager.defaultPerformer.perform(.alignment, performanceTime: .now)
-        NSLog("Tiles: tiled %d visible windows.", placements.count)
+        NSLog("Tiles: tiled %d visible windows.", tiledCount)
     }
 
     func snapFocusedWindow(at point: CGPoint) {
-        guard let window = focusedWindow() ?? lastExternalWindow else {
+        refreshVisibleGroups()
+        guard let window = focusedWindow() else {
             NSLog("Tiles: no focused window found. Check Accessibility permission for Tiles/Terminal.")
             showAccessibilityAlertIfNeeded()
             return
@@ -142,23 +133,28 @@ final class WindowManager {
     }
 
     private func snap(window: (id: CGWindowID, element: AXUIElement), at point: CGPoint) {
-        guard let screen = screen(containing: point) else { return }
+        refreshVisibleGroups()
+        guard let screen = screen(containing: point),
+              let context = stageGroups.activeContext(on: displayID(for: screen)),
+              let identity = identity(for: window.id), stageGroups.permits(window: identity, in: context) else { return }
         elements[window.id] = window.element
         let zone = TilingGeometry.snapZone(at: point, in: screen.frame) ?? (point.x < screen.frame.midX ? .left : .right)
-        slots = TilingState.updatingForSnap(slots, inserting: window.id, on: screen, in: zone)
-        applyLayout(on: screen)
+        let arranged = TilingGeometry.arrange(
+            existing: stageGroups.slots(in: context), inserting: window.id, in: zone
+        )
+        stageGroups.setSlots(arranged, in: context)
+        applyLayout(in: context, on: screen)
         NSLog(zone == .top ? "Tiles: maximized window %u" : "Tiles: snapped window %u", window.id)
     }
 
-    private func applyLayout(on screen: NSScreen) {
-        let screenSlots = slots.filter { $0.screenID == screen }
-        for slot in screenSlots {
-            let frame = TilingGeometry.frame(
-                for: LayoutSlot(windowID: slot.windowID, start: slot.start, end: slot.end),
-                in: screen.visibleFrame
-            )
-            setFrame(frame, for: slot.windowID)
-            expected[slot.windowID] = frame
+    private func applyLayout(in context: StageGroupContext<DisplayID>, on screen: NSScreen) {
+        let visibleIDs = Set(context.visibleWindows.map(\.windowID))
+        let assignments = StageGroupLayout.assignments(
+            slots: stageGroups.slots(in: context), visibleWindowIDs: visibleIDs, visibleFrame: screen.visibleFrame
+        )
+        for assignment in assignments {
+            guard setFrame(assignment.frame, for: assignment.windowID, in: context) else { continue }
+            expected[assignment.windowID] = assignment.frame
         }
     }
 
@@ -166,21 +162,19 @@ final class WindowManager {
         // Boundary dragging is the latency-sensitive path. Avoid AX reads,
         // CGWindow scans, and overlay work after writing both window frames.
         guard boundaryDrag == nil, !boundarySettlePending else { return }
-        if Date().timeIntervalSince(lastSlotCleanup) >= 1 {
-            lastSlotCleanup = Date()
-            slots = slots.filter { windowExists($0.windowID) }
-        }
-        syncLinkedResize()
         if Date().timeIntervalSince(lastZoomCheck) >= 0.08 {
             lastZoomCheck = Date()
+            refreshVisibleGroups()
             updateZoomPalette()
         }
+        syncLinkedResize()
         let mouse = NSEvent.mouseLocation
         var nearestX: CGFloat?
         for screen in NSScreen.screens {
-            let onScreen = slots.filter { $0.screenID == screen }
+            guard let context = stageGroups.activeContext(on: displayID(for: screen)) else { continue }
+            let onScreen = stageGroups.slots(in: context)
             for boundary in 1..<6 where onScreen.contains(where: { $0.end == boundary }) && onScreen.contains(where: { $0.start == boundary }) {
-                guard let x = boundaryX(on: screen, at: boundary) else { continue }
+                guard let x = boundaryX(in: context, at: boundary) else { continue }
                 if BoundaryGeometry.isHit(pointX: mouse.x, dividerX: x, distance: snapDistance) &&
                     BoundaryGeometry.isVerticallyEligible(y: mouse.y, visibleFrame: screen.visibleFrame) {
                     nearestX = x
@@ -220,10 +214,13 @@ final class WindowManager {
     }
 
     private func syncLinkedResize() {
-        for left in slots {
-            for right in slots where right.screenID == left.screenID && right.start == left.end {
-                guard let leftFrame = frame(of: left.windowID), let rightFrame = frame(of: right.windowID),
-                      let oldLeft = expected[left.windowID], let oldRight = expected[right.windowID] else { continue }
+        for screen in NSScreen.screens {
+            guard let context = stageGroups.activeContext(on: displayID(for: screen)) else { continue }
+            let slots = stageGroups.slots(in: context)
+            let visibleIDs = Set(context.visibleWindows.map(\.windowID))
+            for pair in StageGroupLayout.adjacentPairs(slots: slots, visibleWindowIDs: visibleIDs) {
+                guard let leftFrame = frame(of: pair.left), let rightFrame = frame(of: pair.right),
+                      let oldLeft = expected[pair.left], let oldRight = expected[pair.right] else { continue }
                 guard let update = LinkedResizeGeometry.update(
                     left: leftFrame,
                     right: rightFrame,
@@ -233,12 +230,12 @@ final class WindowManager {
                 ) else { continue }
 
                 if update.source == .left {
-                    setFrame(update.right, for: right.windowID)
+                    guard setFrame(update.right, for: pair.right, in: context) else { continue }
                 } else {
-                    setFrame(update.left, for: left.windowID)
+                    guard setFrame(update.left, for: pair.left, in: context) else { continue }
                 }
-                expected[left.windowID] = update.left
-                expected[right.windowID] = update.right
+                expected[pair.left] = update.left
+                expected[pair.right] = update.right
             }
         }
     }
@@ -277,7 +274,7 @@ final class WindowManager {
             leftMinimumWidth: drag.leftMinimumWidth,
             rightMinimumWidth: drag.rightMinimumWidth
         ), abs(plan.divider - drag.lastDivider) >= 0.01 else { return }
-        applyCoupledDragPlan(plan, left: drag.left, right: drag.right)
+        applyCoupledDragPlan(plan, left: drag.left, right: drag.right, in: drag.context)
         expected[drag.left] = plan.left
         expected[drag.right] = plan.right
         drag.lastDivider = plan.divider
@@ -317,9 +314,12 @@ final class WindowManager {
 
     private func boundaryAt(_ point: CGPoint) -> BoundaryDrag? {
         for screen in NSScreen.screens {
+            guard BoundaryGeometry.isVerticallyEligible(y: point.y, visibleFrame: screen.visibleFrame),
+                  let context = stageGroups.activeContext(on: displayID(for: screen)) else { continue }
+            let slots = stageGroups.slots(in: context)
             for boundary in 1..<6 {
-                guard let left = slots.first(where: { $0.screenID == screen && $0.end == boundary }),
-                      let right = slots.first(where: { $0.screenID == screen && $0.start == boundary }),
+                guard let left = slots.first(where: { $0.end == boundary }),
+                      let right = slots.first(where: { $0.start == boundary }),
                       let leftFrame = frame(of: left.windowID), let rightFrame = frame(of: right.windowID) else { continue }
                 let x = BoundaryGeometry.dividerX(left: leftFrame, right: rightFrame)
                 if BoundaryGeometry.isHit(pointX: point.x, dividerX: x, distance: snapDistance) {
@@ -339,6 +339,7 @@ final class WindowManager {
                         leftMinimumWidth: leftMinimumWidth,
                         rightMinimumWidth: rightMinimumWidth,
                         legalDividerRange: legalDividerRange,
+                        context: context,
                         lastDivider: x
                     )
                 }
@@ -347,18 +348,26 @@ final class WindowManager {
         return nil
     }
 
-    private func applyCoupledDragPlan(_ plan: CoupledDragPlan, left: CGWindowID, right: CGWindowID) {
+    private func applyCoupledDragPlan(
+        _ plan: CoupledDragPlan,
+        left: CGWindowID,
+        right: CGWindowID,
+        in context: StageGroupContext<DisplayID>
+    ) {
+        guard stageGroups.isCurrent(context) else { return }
         if plan.writeOrder == .rightThenLeft {
-            setFrame(plan.right, for: right)
-            setFrame(plan.left, for: left)
+            guard setFrame(plan.right, for: right, in: context) else { return }
+            _ = setFrame(plan.left, for: left, in: context)
         } else {
-            setFrame(plan.left, for: left)
-            setFrame(plan.right, for: right)
+            guard setFrame(plan.left, for: left, in: context) else { return }
+            _ = setFrame(plan.right, for: right, in: context)
         }
     }
 
     private func settleBoundaryDrag(_ drag: BoundaryDrag) {
-        guard let actualLeft = frame(of: drag.left), let actualRight = frame(of: drag.right),
+        refreshVisibleGroups()
+        guard stageGroups.isCurrent(drag.context),
+              let actualLeft = frame(of: drag.left), let actualRight = frame(of: drag.right),
               let divider = CoupledDragGeometry.correctionDivider(
                   desiredDivider: drag.lastDivider,
                   actualLeft: actualLeft,
@@ -372,20 +381,22 @@ final class WindowManager {
                   leftMinimumWidth: drag.leftMinimumWidth,
                   rightMinimumWidth: drag.rightMinimumWidth
               ) else { return }
-        applyCoupledDragPlan(plan, left: drag.left, right: drag.right)
+        applyCoupledDragPlan(plan, left: drag.left, right: drag.right, in: drag.context)
         expected[drag.left] = plan.left
         expected[drag.right] = plan.right
     }
 
-    private func boundaryX(on screen: NSScreen, at boundary: Int) -> CGFloat? {
-        guard let left = slots.first(where: { $0.screenID == screen && $0.end == boundary }),
-              let right = slots.first(where: { $0.screenID == screen && $0.start == boundary }),
+    private func boundaryX(in context: StageGroupContext<DisplayID>, at boundary: Int) -> CGFloat? {
+        let slots = stageGroups.slots(in: context)
+        guard let left = slots.first(where: { $0.end == boundary }),
+              let right = slots.first(where: { $0.start == boundary }),
               let leftFrame = frame(of: left.windowID), let rightFrame = frame(of: right.windowID) else { return nil }
         return BoundaryGeometry.dividerX(left: leftFrame, right: rightFrame)
     }
 
     private func updatePreview(at point: CGPoint) {
-        guard let screen = screen(containing: point) else {
+        guard let screen = screen(containing: point),
+              let context = stageGroups.activeContext(on: displayID(for: screen)) else {
             preview?.close(); preview = nil
             previewScreen = nil
             layoutWidget?.close(); layoutWidget = nil
@@ -398,7 +409,7 @@ final class WindowManager {
             NSHapticFeedbackManager.defaultPerformer.perform(.alignment, performanceTime: .now)
         }
         activeSnapZone = zone
-        let current = slots.filter { $0.screenID == screen && $0.windowID != draggedWindow?.id }
+        let current = stageGroups.slots(in: context).filter { $0.windowID != draggedWindow?.id }
             .map { (CGFloat($0.start) / 6, CGFloat($0.end) / 6) }
         var future: (CGFloat, CGFloat)?
         if let zone {
@@ -450,6 +461,11 @@ final class WindowManager {
             zoomPalette?.close(); zoomPalette = nil; zoomPaletteWindowID = nil
             return
         }
+        guard let context = stageGroups.activeContext(on: displayID(for: screen)),
+              let identity = identity(for: window.id), stageGroups.permits(window: identity, in: context) else {
+            zoomPalette?.close(); zoomPalette = nil; zoomPaletteWindowID = nil
+            return
+        }
         elements[window.id] = window.element
         if zoomPaletteWindowID != window.id {
             zoomPalette?.close()
@@ -473,11 +489,89 @@ final class WindowManager {
     }
 
     private func applyPaletteLayout(to window: (id: CGWindowID, element: AXUIElement), start: Int, end: Int, screen: NSScreen) {
+        refreshVisibleGroups()
+        guard let context = stageGroups.activeContext(on: displayID(for: screen)),
+              let identity = identity(for: window.id), stageGroups.permits(window: identity, in: context) else { return }
         elements[window.id] = window.element
-        slots = TilingState.updatingForPalette(slots, placing: window.id, start: start, end: end, on: screen)
-        applyLayout(on: screen)
+        let retained = stageGroups.slots(in: context).filter {
+            $0.windowID != window.id && ($0.start >= end || $0.end <= start)
+        }
+        stageGroups.setSlots(retained + [LayoutSlot(windowID: window.id, start: start, end: end)], in: context)
+        applyLayout(in: context, on: screen)
         zoomPalette?.close(); zoomPalette = nil; zoomPaletteWindowID = nil
         NSHapticFeedbackManager.defaultPerformer.perform(.alignment, performanceTime: .now)
+    }
+
+    private func refreshVisibleGroups() {
+        let screens = NSScreen.screens
+        let displayHeight = screens.first?.frame.maxY ?? 0
+        let ownPID = ProcessInfo.processInfo.processIdentifier
+        let windowInfo = CGWindowListCopyWindowInfo(
+            [.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID
+        ) as? [[String: Any]] ?? []
+        var scanned: [WindowIdentity: VisibleRuntimeWindow] = [:]
+        var order: [WindowIdentity] = []
+
+        for info in windowInfo {
+            guard (info[kCGWindowLayer as String] as? NSNumber)?.intValue == 0,
+                  (info[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value != ownPID,
+                  ((info[kCGWindowAlpha as String] as? NSNumber)?.doubleValue ?? 1) > 0,
+                  let number = info[kCGWindowNumber as String] as? NSNumber,
+                  let pid = info[kCGWindowOwnerPID as String] as? pid_t,
+                  let bounds = info[kCGWindowBounds as String] as? NSDictionary else { continue }
+            var quartzFrame = CGRect.zero
+            guard CGRectMakeWithDictionaryRepresentation(bounds, &quartzFrame) else { continue }
+            let frame = CoordinateGeometry.flipVertically(quartzFrame, displayHeight: displayHeight)
+            guard let screenIndex = ScreenGeometry.index(
+                containing: CGPoint(x: frame.midX, y: frame.midY), frames: screens.map(\.frame), tolerance: 0
+            ) else { continue }
+            let windowID = CGWindowID(number.uint32Value)
+            guard let element = visibleWindowElement(for: windowID, pid: pid, expectedFrame: frame) else { continue }
+            let identity = WindowIdentity(windowID: windowID, ownerPID: pid)
+            let record = VisibleRuntimeWindow(
+                identity: identity, frame: frame, element: element, screenID: displayID(for: screens[screenIndex])
+            )
+            scanned[identity] = record
+            order.append(identity)
+            elements[windowID] = element
+        }
+
+        visibleWindows = scanned
+        visibleWindowOrder = order
+        for screen in screens {
+            let screenID = displayID(for: screen)
+            let signature = Set(scanned.values.filter { $0.screenID == screenID }.map(\.identity))
+            let previous = stageGroups.activeContext(on: screenID)
+            let observation = stageGroups.observe(screenID: screenID, visibleWindows: signature)
+            switch observation {
+            case let .active(context):
+                if previous != context {
+                    for identity in context.visibleWindows {
+                        if let currentFrame = scanned[identity]?.frame { expected[identity.windowID] = currentFrame }
+                    }
+                }
+            case .none, .transitioning:
+                closeSnapOverlays()
+                if boundaryDrag?.context.key.screenID == screenID { boundaryDrag = nil }
+            }
+        }
+    }
+
+    private func closeSnapOverlays() {
+        preview?.close(); preview = nil; previewScreen = nil
+        layoutWidget?.close(); layoutWidget = nil; layoutWidgetScreen = nil
+        activeSnapZone = nil
+    }
+
+    private func displayID(for screen: NSScreen) -> DisplayID {
+        if let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber {
+            return number.uint32Value
+        }
+        return DisplayID(NSScreen.screens.firstIndex(of: screen) ?? 0) + 1
+    }
+
+    private func identity(for windowID: CGWindowID) -> WindowIdentity? {
+        visibleWindows.keys.first { $0.windowID == windowID }
     }
 
     private func focusedWindow() -> (id: CGWindowID, element: AXUIElement)? {
@@ -492,7 +586,6 @@ final class WindowManager {
         AXUIElementCopyAttributeValue(window, axWindowNumberAttribute as CFString, &number)
         if let number = number as? NSNumber {
             let result = (id: CGWindowID(number.uint32Value), element: window)
-            lastExternalWindow = result
             return result
         }
 
@@ -509,7 +602,6 @@ final class WindowManager {
             guard CGRectMakeWithDictionaryRepresentation(bounds, &cgFrame), abs(cgFrame.width - axFrame.width) < 3,
                   abs(cgFrame.height - axFrame.height) < 3 else { continue }
             let result = (id: CGWindowID(number.uint32Value), element: window)
-            lastExternalWindow = result
             return result
         }
         return nil
@@ -530,7 +622,10 @@ final class WindowManager {
 
             var number: CFTypeRef?
             AXUIElementCopyAttributeValue(item, axWindowNumberAttribute as CFString, &number)
-            if let number = number as? NSNumber, number.uint32Value != id { continue }
+            if let number = number as? NSNumber {
+                if number.uint32Value == id { return item }
+                continue
+            }
             guard let frame = axFrame(of: item).map({
                 CoordinateGeometry.flipVertically($0, displayHeight: displayHeight)
             }), framesApproximatelyMatch(frame, expectedFrame) else { continue }
@@ -564,12 +659,22 @@ final class WindowManager {
         return size.width
     }
 
-    private func setFrame(_ frame: CGRect, for id: CGWindowID) {
+    private func setFrame(
+        _ frame: CGRect,
+        for id: CGWindowID,
+        in context: StageGroupContext<DisplayID>
+    ) -> Bool {
+        guard stageGroups.isCurrent(context), let identity = identity(for: id),
+              stageGroups.permits(window: identity, in: context), visibleWindows[identity] != nil else { return false }
+        return setFrameUnchecked(frame, for: id)
+    }
+
+    private func setFrameUnchecked(_ frame: CGRect, for id: CGWindowID) -> Bool {
         if let item = elements[id] {
             setFrame(frame, on: item)
-            return
+            return true
         }
-        guard let app = application(for: id) else { return }
+        guard let app = application(for: id) else { return false }
         let axApp = AXUIElementCreateApplication(app.processIdentifier)
         var value: CFTypeRef?
         AXUIElementCopyAttributeValue(axApp, kAXWindowsAttribute as CFString, &value)
@@ -579,8 +684,9 @@ final class WindowManager {
             guard (number as? NSNumber)?.uint32Value == id else { continue }
             elements[id] = item
             setFrame(frame, on: item)
-            return
+            return true
         }
+        return false
     }
 
     private func setFrame(_ frame: CGRect, on item: AXUIElement) {

@@ -97,6 +97,127 @@ final class TilingStateTests: XCTestCase {
     }
 }
 
+final class StageGroupStoreTests: XCTestCase {
+    private let a = WindowIdentity(windowID: 1, ownerPID: 10)
+    private let b = WindowIdentity(windowID: 2, ownerPID: 20)
+    private let c = WindowIdentity(windowID: 3, ownerPID: 30)
+    private let d = WindowIdentity(windowID: 4, ownerPID: 40)
+
+    func testGroupActivatesOnlyAfterStableSamples() throws {
+        var store = StageGroupStore<Int>()
+        XCTAssertEqual(store.observe(screenID: 1, visibleWindows: [a, b]), .transitioning)
+        let context = try active(store.observe(screenID: 1, visibleWindows: [a, b]))
+        XCTAssertEqual(context.visibleWindows, [a, b])
+    }
+
+    func testSetChangeRevokesOldContextImmediately() throws {
+        var store = StageGroupStore<Int>(requiredStableSamples: 1)
+        let old = try active(store.observe(screenID: 1, visibleWindows: [a, b]))
+        store.setSlots([LayoutSlot(windowID: 1, start: 0, end: 3)], in: old)
+        let current = try active(store.observe(screenID: 1, visibleWindows: [c, d]))
+        XCTAssertFalse(store.isCurrent(old))
+        XCTAssertFalse(store.permits(window: a, in: old))
+        XCTAssertTrue(store.slots(in: old).isEmpty)
+        XCTAssertTrue(store.isCurrent(current))
+    }
+
+    func testSwitchingAwayAndBackRestoresGroupIDAndSlots() throws {
+        var store = StageGroupStore<Int>(requiredStableSamples: 1)
+        let first = try active(store.observe(screenID: 1, visibleWindows: [a, b]))
+        store.setSlots([LayoutSlot(windowID: 1, start: 0, end: 3)], in: first)
+        _ = store.observe(screenID: 1, visibleWindows: [c, d])
+        let restored = try active(store.observe(screenID: 1, visibleWindows: [a, b]))
+        XCTAssertEqual(restored.key.groupID, first.key.groupID)
+        XCTAssertEqual(store.slots(in: restored), [LayoutSlot(windowID: 1, start: 0, end: 3)])
+    }
+
+    func testGroupsOnSameScreenKeepIndependentSlots() throws {
+        var store = StageGroupStore<Int>(requiredStableSamples: 1)
+        let first = try active(store.observe(screenID: 1, visibleWindows: [a, b]))
+        store.setSlots([LayoutSlot(windowID: 1, start: 0, end: 3)], in: first)
+        let second = try active(store.observe(screenID: 1, visibleWindows: [c, d]))
+        store.setSlots([LayoutSlot(windowID: 3, start: 3, end: 6)], in: second)
+        XCTAssertNotEqual(first.key.groupID, second.key.groupID)
+        XCTAssertEqual(store.storedGroupCount, 2)
+        let restored = try active(store.observe(screenID: 1, visibleWindows: [a, b]))
+        XCTAssertEqual(store.slots(in: restored).map(\.windowID), [1])
+    }
+
+    func testAddingWindowConservativelyMatchesExistingGroup() throws {
+        var store = StageGroupStore<Int>(requiredStableSamples: 1)
+        let first = try active(store.observe(screenID: 1, visibleWindows: [a, b]))
+        let expanded = try active(store.observe(screenID: 1, visibleWindows: [a, b, c]))
+        XCTAssertEqual(expanded.key.groupID, first.key.groupID)
+    }
+
+    func testAmbiguousUnionDoesNotMergeTwoGroups() throws {
+        var store = StageGroupStore<Int>(requiredStableSamples: 1)
+        let first = try active(store.observe(screenID: 1, visibleWindows: [a, b]))
+        let second = try active(store.observe(screenID: 1, visibleWindows: [c, d]))
+        let union = try active(store.observe(screenID: 1, visibleWindows: [a, b, c, d]))
+        XCTAssertNotEqual(union.key.groupID, first.key.groupID)
+        XCTAssertNotEqual(union.key.groupID, second.key.groupID)
+    }
+
+    func testReusedWindowIDWithDifferentPIDDoesNotMatch() throws {
+        var store = StageGroupStore<Int>(requiredStableSamples: 1)
+        let first = try active(store.observe(screenID: 1, visibleWindows: [a]))
+        let reused = WindowIdentity(windowID: a.windowID, ownerPID: 999)
+        let second = try active(store.observe(screenID: 1, visibleWindows: [reused]))
+        XCTAssertNotEqual(first.key.groupID, second.key.groupID)
+    }
+
+    func testScreensMaintainIndependentActiveGroups() throws {
+        var store = StageGroupStore<Int>(requiredStableSamples: 1)
+        let first = try active(store.observe(screenID: 1, visibleWindows: [a]))
+        let second = try active(store.observe(screenID: 2, visibleWindows: [b]))
+        XCTAssertEqual(store.activeContext(on: 1), first)
+        XCTAssertEqual(store.activeContext(on: 2), second)
+    }
+
+    func testEmptyVisibilityDeactivatesButPreservesStoredGroup() throws {
+        var store = StageGroupStore<Int>(requiredStableSamples: 1)
+        let context = try active(store.observe(screenID: 1, visibleWindows: [a]))
+        store.setSlots([LayoutSlot(windowID: 1, start: 0, end: 6)], in: context)
+        XCTAssertEqual(store.observe(screenID: 1, visibleWindows: []), .none)
+        XCTAssertNil(store.activeContext(on: 1))
+        XCTAssertEqual(store.storedGroupCount, 1)
+    }
+
+    private func active(_ observation: StageGroupObservation<Int>) throws -> StageGroupContext<Int> {
+        guard case let .active(context) = observation else {
+            throw NSError(domain: "StageGroupStoreTests", code: 1)
+        }
+        return context
+    }
+}
+
+final class StageGroupLayoutTests: XCTestCase {
+    private let slots = [
+        LayoutSlot(windowID: 1, start: 0, end: 2),
+        LayoutSlot(windowID: 2, start: 2, end: 4),
+        LayoutSlot(windowID: 3, start: 4, end: 6)
+    ]
+
+    func testAssignmentsExcludeOffStageWindows() {
+        let assignments = StageGroupLayout.assignments(
+            slots: slots, visibleWindowIDs: [1, 3], visibleFrame: CGRect(x: 0, y: 0, width: 1200, height: 900)
+        )
+        XCTAssertEqual(assignments.map(\.windowID), [1, 3])
+    }
+
+    func testNoVisibleWindowsProduceNoAssignments() {
+        XCTAssertTrue(StageGroupLayout.assignments(
+            slots: slots, visibleWindowIDs: [], visibleFrame: CGRect(x: 0, y: 0, width: 1200, height: 900)
+        ).isEmpty)
+    }
+
+    func testAdjacentPairsRequireBothWindowsToBeVisible() {
+        XCTAssertEqual(StageGroupLayout.adjacentPairs(slots: slots, visibleWindowIDs: [1, 2]).map { [$0.left, $0.right] }, [[1, 2]])
+        XCTAssertTrue(StageGroupLayout.adjacentPairs(slots: slots, visibleWindowIDs: [1, 3]).isEmpty)
+    }
+}
+
 final class ScreenGeometryTests: XCTestCase {
     private let frames = [
         CGRect(x: -1200, y: 0, width: 1200, height: 900),

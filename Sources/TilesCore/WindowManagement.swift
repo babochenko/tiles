@@ -46,6 +46,197 @@ public struct PlacedSlot<ScreenID: Hashable>: Equatable {
     }
 }
 
+public struct WindowIdentity: Hashable, Equatable {
+    public let windowID: UInt32
+    public let ownerPID: Int32
+
+    public init(windowID: UInt32, ownerPID: Int32) {
+        self.windowID = windowID
+        self.ownerPID = ownerPID
+    }
+}
+
+public struct StageGroupID: Hashable, Equatable {
+    public let rawValue: UInt64
+
+    public init(rawValue: UInt64) {
+        self.rawValue = rawValue
+    }
+}
+
+public struct StageGroupKey<ScreenID: Hashable>: Hashable {
+    public let groupID: StageGroupID
+    public let screenID: ScreenID
+
+    public init(groupID: StageGroupID, screenID: ScreenID) {
+        self.groupID = groupID
+        self.screenID = screenID
+    }
+}
+
+public struct StageGroupContext<ScreenID: Hashable>: Equatable {
+    public let key: StageGroupKey<ScreenID>
+    public let visibleWindows: Set<WindowIdentity>
+    public let generation: UInt64
+
+    public init(key: StageGroupKey<ScreenID>, visibleWindows: Set<WindowIdentity>, generation: UInt64) {
+        self.key = key
+        self.visibleWindows = visibleWindows
+        self.generation = generation
+    }
+}
+
+public enum StageGroupObservation<ScreenID: Hashable>: Equatable {
+    case none
+    case transitioning
+    case active(StageGroupContext<ScreenID>)
+}
+
+private struct StageGroupRecord<ScreenID: Hashable> {
+    let key: StageGroupKey<ScreenID>
+    var signature: Set<WindowIdentity>
+    var slots: [LayoutSlot]
+}
+
+private struct PendingStageGroup {
+    var signature: Set<WindowIdentity>
+    var sampleCount: Int
+}
+
+public struct StageGroupStore<ScreenID: Hashable> {
+    private var records: [StageGroupKey<ScreenID>: StageGroupRecord<ScreenID>] = [:]
+    private var activeContexts: [ScreenID: StageGroupContext<ScreenID>] = [:]
+    private var pending: [ScreenID: PendingStageGroup] = [:]
+    private var nextGroupID: UInt64 = 1
+    private var generation: UInt64 = 0
+    private let requiredStableSamples: Int
+
+    public init(requiredStableSamples: Int = 2) {
+        self.requiredStableSamples = max(1, requiredStableSamples)
+    }
+
+    public mutating func observe(
+        screenID: ScreenID,
+        visibleWindows: Set<WindowIdentity>
+    ) -> StageGroupObservation<ScreenID> {
+        guard !visibleWindows.isEmpty else {
+            if activeContexts.removeValue(forKey: screenID) != nil { generation += 1 }
+            pending.removeValue(forKey: screenID)
+            return .none
+        }
+
+        if let active = activeContexts[screenID], active.visibleWindows == visibleWindows {
+            return .active(active)
+        }
+
+        if pending[screenID]?.signature == visibleWindows {
+            pending[screenID]?.sampleCount += 1
+        } else {
+            generation += 1
+            activeContexts.removeValue(forKey: screenID)
+            pending[screenID] = PendingStageGroup(signature: visibleWindows, sampleCount: 1)
+        }
+
+        guard let candidate = pending[screenID], candidate.sampleCount >= requiredStableSamples else {
+            return .transitioning
+        }
+        pending.removeValue(forKey: screenID)
+
+        let key = matchingKey(screenID: screenID, signature: visibleWindows) ?? createRecord(
+            screenID: screenID,
+            signature: visibleWindows
+        )
+        records[key]?.signature = visibleWindows
+        generation += 1
+        let context = StageGroupContext(key: key, visibleWindows: visibleWindows, generation: generation)
+        activeContexts[screenID] = context
+        return .active(context)
+    }
+
+    public func activeContext(on screenID: ScreenID) -> StageGroupContext<ScreenID>? {
+        activeContexts[screenID]
+    }
+
+    public func isCurrent(_ context: StageGroupContext<ScreenID>) -> Bool {
+        activeContexts[context.key.screenID] == context
+    }
+
+    public func slots(in context: StageGroupContext<ScreenID>) -> [LayoutSlot] {
+        guard isCurrent(context) else { return [] }
+        let visibleIDs = Set(context.visibleWindows.map(\.windowID))
+        return records[context.key]?.slots.filter { visibleIDs.contains($0.windowID) } ?? []
+    }
+
+    public mutating func setSlots(_ slots: [LayoutSlot], in context: StageGroupContext<ScreenID>) {
+        guard isCurrent(context) else { return }
+        records[context.key]?.slots = slots
+    }
+
+    public func permits(window: WindowIdentity, in context: StageGroupContext<ScreenID>) -> Bool {
+        isCurrent(context) && context.visibleWindows.contains(window)
+    }
+
+    public var storedGroupCount: Int { records.count }
+
+    private func matchingKey(screenID: ScreenID, signature: Set<WindowIdentity>) -> StageGroupKey<ScreenID>? {
+        let localRecords = records.values.filter { $0.key.screenID == screenID }
+        if let exact = localRecords.first(where: { $0.signature == signature }) { return exact.key }
+
+        let matches = localRecords.compactMap { record -> (StageGroupKey<ScreenID>, Double)? in
+            let intersection = record.signature.intersection(signature).count
+            guard intersection > 0 else { return nil }
+            let union = record.signature.union(signature).count
+            let score = Double(intersection) / Double(union)
+            return score >= 0.5 ? (record.key, score) : nil
+        }.sorted { $0.1 > $1.1 }
+        guard let best = matches.first else { return nil }
+        if matches.count > 1, matches[1].1 == best.1 { return nil }
+        return best.0
+    }
+
+    private mutating func createRecord(
+        screenID: ScreenID,
+        signature: Set<WindowIdentity>
+    ) -> StageGroupKey<ScreenID> {
+        let key = StageGroupKey(groupID: StageGroupID(rawValue: nextGroupID), screenID: screenID)
+        nextGroupID += 1
+        records[key] = StageGroupRecord(key: key, signature: signature, slots: [])
+        return key
+    }
+}
+
+public struct WindowFrameAssignment: Equatable {
+    public let windowID: UInt32
+    public let frame: CGRect
+
+    public init(windowID: UInt32, frame: CGRect) {
+        self.windowID = windowID
+        self.frame = frame
+    }
+}
+
+public enum StageGroupLayout {
+    public static func assignments(
+        slots: [LayoutSlot],
+        visibleWindowIDs: Set<UInt32>,
+        visibleFrame: CGRect
+    ) -> [WindowFrameAssignment] {
+        slots.filter { visibleWindowIDs.contains($0.windowID) }.map {
+            WindowFrameAssignment(windowID: $0.windowID, frame: TilingGeometry.frame(for: $0, in: visibleFrame))
+        }
+    }
+
+    public static func adjacentPairs(
+        slots: [LayoutSlot],
+        visibleWindowIDs: Set<UInt32>
+    ) -> [(left: UInt32, right: UInt32)] {
+        let visible = slots.filter { visibleWindowIDs.contains($0.windowID) }
+        return visible.flatMap { left in
+            visible.filter { $0.start == left.end }.map { (left.windowID, $0.windowID) }
+        }
+    }
+}
+
 public enum TilingState {
     public static func updatingForSnap<ScreenID: Hashable>(
         _ slots: [PlacedSlot<ScreenID>],
