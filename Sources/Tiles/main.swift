@@ -587,6 +587,9 @@ final class WindowManager {
             guard let screenIndex = ScreenGeometry.index(
                 containing: CGPoint(x: frame.midX, y: frame.midY), frames: screens.map(\.frame), tolerance: 0
             ) else { continue }
+            guard !TilingGeometry.isCenteredInStageManagerStrip(
+                windowFrame: frame, screenFrame: screens[screenIndex].frame
+            ) else { continue }
             let windowID = CGWindowID(number.uint32Value)
             guard let element = visibleWindowElement(for: windowID, pid: pid, expectedFrame: frame) else { continue }
             let identity = WindowIdentity(windowID: windowID, ownerPID: pid)
@@ -661,8 +664,8 @@ final class WindowManager {
             guard let bounds = info[kCGWindowBounds as String] as? NSDictionary,
                   let number = info[kCGWindowNumber as String] as? NSNumber else { continue }
             var cgFrame = CGRect.zero
-            guard CGRectMakeWithDictionaryRepresentation(bounds, &cgFrame), abs(cgFrame.width - axFrame.width) < 3,
-                  abs(cgFrame.height - axFrame.height) < 3 else { continue }
+            guard CGRectMakeWithDictionaryRepresentation(bounds, &cgFrame),
+                  VisibleWindowMatching.framesApproximatelyMatch(cgFrame, axFrame) else { continue }
             let result = (id: CGWindowID(number.uint32Value), element: window)
             return result
         }

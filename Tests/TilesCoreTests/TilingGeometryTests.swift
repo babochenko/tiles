@@ -195,6 +195,16 @@ final class TilingGeometryTests: XCTestCase {
         ))
     }
 
+    func testStageManagerThumbnailCentersAreExcludedOnTranslatedScreens() {
+        let translated = CGRect(x: -1200, y: 0, width: 1200, height: 900)
+        XCTAssertTrue(TilingGeometry.isCenteredInStageManagerStrip(
+            windowFrame: CGRect(x: -1190, y: 300, width: 180, height: 120), screenFrame: translated
+        ))
+        XCTAssertFalse(TilingGeometry.isCenteredInStageManagerStrip(
+            windowFrame: CGRect(x: -1060, y: 100, width: 600, height: 700), screenFrame: translated
+        ))
+    }
+
     func testLinkedResizeIsContinuousAndMaintains15PixelGap() {
         let left = CGRect(x: 15, y: 15, width: 577.5, height: 870)
         let right = CGRect(x: 607.5, y: 15, width: 577.5, height: 870)

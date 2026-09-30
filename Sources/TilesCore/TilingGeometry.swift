@@ -62,6 +62,10 @@ public enum TilingGeometry {
             point.y >= screenVisibleFrame.maxY || overInteractiveTilesWindow
     }
 
+    public static func isCenteredInStageManagerStrip(windowFrame: CGRect, screenFrame: CGRect) -> Bool {
+        windowFrame.midX < screenFrame.minX + leftStageManagerInset
+    }
+
     public static func arrange(existing: [LayoutSlot], inserting windowID: UInt32, in zone: SnapZone) -> [LayoutSlot] {
         if zone == .top { return [LayoutSlot(windowID: windowID, start: 0, end: 6)] }
 

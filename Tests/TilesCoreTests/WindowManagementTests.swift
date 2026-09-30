@@ -257,6 +257,17 @@ final class VisibleWindowMatchingTests: XCTestCase {
         ))
     }
 
+    func testNormalWindowServerDecorationDifferencesStillMatch() {
+        let decoratedFrame = CGRect(x: 78, y: 84, width: 836, height: 632)
+        let candidates = [
+            VisibleWindowCandidate(windowID: 42, frame: expected, wasPreviouslyMatched: false)
+        ]
+        XCTAssertEqual(VisibleWindowMatching.candidateIndex(
+            for: 42, expectedFrame: decoratedFrame, candidates: candidates
+        ), 0)
+        XCTAssertTrue(VisibleWindowMatching.framesApproximatelyMatch(expected, decoratedFrame))
+    }
+
     func testDifferentExplicitWindowNumberCannotUsePreviousMatch() {
         let candidates = [
             VisibleWindowCandidate(windowID: 99, frame: expected, wasPreviouslyMatched: true)
