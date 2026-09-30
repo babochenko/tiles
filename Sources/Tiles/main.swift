@@ -26,14 +26,17 @@ final class WindowManager {
     private var expected: [CGWindowID: CGRect] = [:]
     private var elements: [CGWindowID: AXUIElement] = [:]
     private var timer: Timer?
-    private var mouseSequenceGate = MouseSequenceGate()
+    private var mouseEventMonitor: Any?
+    private var ignoringMouseSequence = false
     private var boundaryDrag: BoundaryDrag?
     private var boundarySettlePending = false
     private var draggedWindow: (id: CGWindowID, element: AXUIElement)?
     private var lastExternalWindow: (id: CGWindowID, element: AXUIElement)?
     private var overlay: BoundaryOverlay?
     private var preview: SnapPreviewPanel?
+    private var previewScreen: NSScreen?
     private var layoutWidget: LayoutPreviewPanel?
+    private var layoutWidgetScreen: NSScreen?
     private var zoomPalette: ZoomPalettePanel?
     private var zoomPaletteWindowID: CGWindowID?
     private var cursorIsResizing = false
@@ -45,6 +48,14 @@ final class WindowManager {
 
     func start() {
         requestAccessibility()
+        mouseEventMonitor = NSEvent.addGlobalMonitorForEvents(
+            matching: [.leftMouseDown, .leftMouseDragged, .leftMouseUp]
+        ) { [weak self] event in
+            let point = NSEvent.mouseLocation
+            DispatchQueue.main.async {
+                self?.handleMouseEvent(event.type, at: point)
+            }
+        }
         let refreshTimer = Timer(timeInterval: 1.0 / 120.0, repeats: true) { [weak self] _ in
             self?.reconcileAndShowBoundary()
         }
@@ -52,6 +63,10 @@ final class WindowManager {
         RunLoop.main.add(refreshTimer, forMode: .common)
         timer = refreshTimer
         NSLog("Tiles: running. Drag a window to a physical screen edge and release it.")
+    }
+
+    deinit {
+        if let mouseEventMonitor { NSEvent.removeMonitor(mouseEventMonitor) }
     }
 
     func tileFocusedWindow(start: Int, end: Int) {
@@ -148,7 +163,6 @@ final class WindowManager {
     }
 
     private func reconcileAndShowBoundary() {
-        pollMouse()
         // Boundary dragging is the latency-sensitive path. Avoid AX reads,
         // CGWindow scans, and overlay work after writing both window frames.
         guard boundaryDrag == nil, !boundarySettlePending else { return }
@@ -184,24 +198,24 @@ final class WindowManager {
         }
     }
 
-    private func pollMouse() {
-        let isDown = CGEventSource.buttonState(.combinedSessionState, button: .left)
-        let point = NSEvent.mouseLocation
-        var shouldIgnoreNewPress = false
-        if isDown && !mouseSequenceGate.isButtonDown {
+    private func handleMouseEvent(_ type: NSEvent.EventType, at point: CGPoint) {
+        switch type {
+        case .leftMouseDown:
             let inTilesWindow = NSApp.windows.contains {
                 $0.isVisible && !$0.ignoresMouseEvents && $0.frame.contains(point)
             }
-            shouldIgnoreNewPress = screen(containing: point).map {
+            ignoringMouseSequence = screen(containing: point).map {
                 TilingGeometry.shouldIgnoreMouseDown(at: point, screenVisibleFrame: $0.visibleFrame,
                                                      overInteractiveTilesWindow: inTilesWindow)
             } ?? inTilesWindow
-        }
-        switch mouseSequenceGate.update(isDown: isDown, ignoreNewPress: shouldIgnoreNewPress) {
-        case .down: mouseDown(at: point)
-        case .dragged: mouseDragged(at: point)
-        case .up: mouseUp(at: point)
-        case nil: break
+            if !ignoringMouseSequence { mouseDown(at: point) }
+        case .leftMouseDragged:
+            if !ignoringMouseSequence { mouseDragged(at: point) }
+        case .leftMouseUp:
+            if !ignoringMouseSequence { mouseUp(at: point) }
+            ignoringMouseSequence = false
+        default:
+            break
         }
     }
 
@@ -235,7 +249,8 @@ final class WindowManager {
             NSCursor.resizeLeftRight.set()
             cursorIsResizing = true
             overlay?.close()
-            preview?.close()
+            preview?.close(); preview = nil; previewScreen = nil
+            layoutWidget?.close(); layoutWidget = nil; layoutWidgetScreen = nil
             pendingSnap = false
             snapDragGesture.reset()
         } else {
@@ -279,8 +294,10 @@ final class WindowManager {
         }
         preview?.close()
         preview = nil
+        previewScreen = nil
         layoutWidget?.close()
         layoutWidget = nil
+        layoutWidgetScreen = nil
         activeSnapZone = nil
         let shouldSnap = snapDragGesture.mouseUp()
         if pendingSnap && shouldSnap {
@@ -370,7 +387,9 @@ final class WindowManager {
     private func updatePreview(at point: CGPoint) {
         guard let screen = screen(containing: point) else {
             preview?.close(); preview = nil
+            previewScreen = nil
             layoutWidget?.close(); layoutWidget = nil
+            layoutWidgetScreen = nil
             activeSnapZone = nil
             return
         }
@@ -386,20 +405,35 @@ final class WindowManager {
             let range = TilingGeometry.previewRange(existingCount: current.count, zone: zone)
             future = (range.lowerBound, range.upperBound)
         }
-        if layoutWidget == nil { layoutWidget = LayoutPreviewPanel() }
+        if layoutWidgetScreen != screen {
+            layoutWidget?.close()
+            layoutWidget = nil
+        }
+        if layoutWidget == nil {
+            layoutWidget = LayoutPreviewPanel()
+            layoutWidgetScreen = screen
+        }
         layoutWidget?.show(on: screen, current: current, future: future)
 
         guard let zone else {
             preview?.close(); preview = nil
+            previewScreen = nil
             return
         }
 
-        let range = TilingGeometry.previewRange(existingCount: current.count, zone: zone)
-        let target = TilingGeometry.frame(
-            for: LayoutSlot(windowID: 0, start: Int(round(range.lowerBound * 6)), end: Int(round(range.upperBound * 6))),
-            in: screen.visibleFrame
+        let target = OverlayGeometry.snapPreviewFrame(
+            existingCount: current.count,
+            zone: zone,
+            visibleFrame: screen.visibleFrame
         )
-        if preview == nil { preview = SnapPreviewPanel() }
+        if previewScreen != screen {
+            preview?.close()
+            preview = nil
+        }
+        if preview == nil {
+            preview = SnapPreviewPanel()
+            previewScreen = screen
+        }
         preview?.show(frame: target)
     }
 
@@ -611,28 +645,25 @@ final class WindowManager {
 
 final class BoundaryOverlay: NSPanel {
     init(x: CGFloat, y: CGFloat) {
-        super.init(contentRect: NSRect(x: x - 13, y: y - 13, width: 26, height: 26), styleMask: .borderless, backing: .buffered, defer: false)
-        isFloatingPanel = true; level = .screenSaver; backgroundColor = .clear; isOpaque = false; ignoresMouseEvents = true
+        super.init(contentRect: NSRect(x: x - 13, y: y - 13, width: 26, height: 26),
+                   styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        configureAsOverlay()
         contentView = GripView()
     }
-    func show() { orderFrontRegardless() }
+    func show() { contentView?.needsDisplay = true; orderFrontRegardless() }
 }
 
 final class SnapPreviewPanel: NSPanel {
     init() {
-        super.init(contentRect: .zero, styleMask: .borderless, backing: .buffered, defer: false)
-        isFloatingPanel = true
-        level = .screenSaver
-        isOpaque = false
-        backgroundColor = .clear
-        ignoresMouseEvents = true
+        super.init(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        configureAsOverlay()
         hasShadow = false
-        collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         contentView = SnapPreviewView()
     }
 
     func show(frame: CGRect) {
         setFrame(frame, display: true)
+        contentView?.needsDisplay = true
         orderFrontRegardless()
     }
 }
@@ -661,25 +692,33 @@ final class LayoutPreviewPanel: NSPanel {
     private let previewView = LayoutPreviewView()
 
     init() {
-        super.init(contentRect: NSRect(x: 0, y: 0, width: 220, height: 92), styleMask: .borderless, backing: .buffered, defer: false)
-        isFloatingPanel = true
-        level = .screenSaver
-        isOpaque = false
-        backgroundColor = .clear
-        ignoresMouseEvents = true
+        super.init(contentRect: NSRect(x: 0, y: 0, width: 220, height: 92),
+                   styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        configureAsOverlay()
         hasShadow = true
-        collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         contentView = previewView
     }
 
     func show(on screen: NSScreen, current: [(CGFloat, CGFloat)], future: (CGFloat, CGFloat)?) {
-        let size = frame.size
-        setFrameOrigin(NSPoint(x: screen.visibleFrame.maxX - size.width - margin,
-                               y: screen.visibleFrame.maxY - size.height - margin))
+        setFrameOrigin(OverlayGeometry.layoutWidgetOrigin(panelSize: frame.size, visibleFrame: screen.visibleFrame))
         previewView.current = current
         previewView.future = future
         previewView.needsDisplay = true
         orderFrontRegardless()
+    }
+}
+
+private extension NSPanel {
+    func configureAsOverlay() {
+        isFloatingPanel = true
+        level = .modalPanel
+        isOpaque = false
+        backgroundColor = .clear
+        ignoresMouseEvents = true
+        hidesOnDeactivate = false
+        isReleasedWhenClosed = false
+        animationBehavior = .none
+        collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
     }
 }
 

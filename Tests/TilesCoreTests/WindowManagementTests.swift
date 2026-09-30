@@ -410,6 +410,34 @@ final class PaletteGeometryTests: XCTestCase {
     }
 }
 
+final class OverlayGeometryTests: XCTestCase {
+    private let visibleFrame = CGRect(x: -1200, y: 50, width: 1200, height: 850)
+
+    func testLayoutWidgetAppearsInsideTopRightOfVisibleFrame() {
+        XCTAssertEqual(OverlayGeometry.layoutWidgetOrigin(
+            panelSize: CGSize(width: 220, height: 92), visibleFrame: visibleFrame
+        ), CGPoint(x: -235, y: 793))
+    }
+
+    func testLeftSnapPreviewMatchesFirstWindowLayout() {
+        XCTAssertEqual(OverlayGeometry.snapPreviewFrame(
+            existingCount: 0, zone: .left, visibleFrame: visibleFrame
+        ), TilingGeometry.frame(for: LayoutSlot(windowID: 0, start: 0, end: 3), in: visibleFrame))
+    }
+
+    func testRightSnapPreviewMatchesThreeWindowLayout() {
+        XCTAssertEqual(OverlayGeometry.snapPreviewFrame(
+            existingCount: 2, zone: .right, visibleFrame: visibleFrame
+        ), TilingGeometry.frame(for: LayoutSlot(windowID: 0, start: 4, end: 6), in: visibleFrame))
+    }
+
+    func testTopSnapPreviewUsesFullVisibleFrameWithMargins() {
+        XCTAssertEqual(OverlayGeometry.snapPreviewFrame(
+            existingCount: 2, zone: .top, visibleFrame: visibleFrame
+        ), CGRect(x: -1185, y: 65, width: 1170, height: 820))
+    }
+}
+
 final class CoordinateGeometryTests: XCTestCase {
     func testVerticalFlipPreservesHorizontalGeometryAndSize() {
         let frame = CGRect(x: -20, y: 100, width: 300, height: 200)

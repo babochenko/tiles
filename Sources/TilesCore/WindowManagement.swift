@@ -330,6 +330,23 @@ public enum PaletteGeometry {
     }
 }
 
+public enum OverlayGeometry {
+    public static func layoutWidgetOrigin(panelSize: CGSize, visibleFrame: CGRect) -> CGPoint {
+        CGPoint(x: visibleFrame.maxX - panelSize.width - TilingGeometry.margin,
+                y: visibleFrame.maxY - panelSize.height - TilingGeometry.margin)
+    }
+
+    public static func snapPreviewFrame(existingCount: Int, zone: SnapZone, visibleFrame: CGRect) -> CGRect {
+        let range = TilingGeometry.previewRange(existingCount: existingCount, zone: zone)
+        return TilingGeometry.frame(
+            for: LayoutSlot(windowID: 0,
+                            start: Int(round(range.lowerBound * 6)),
+                            end: Int(round(range.upperBound * 6))),
+            in: visibleFrame
+        )
+    }
+}
+
 public enum CoordinateGeometry {
     public static func flipVertically(_ frame: CGRect, displayHeight: CGFloat) -> CGRect {
         CGRect(x: frame.minX, y: displayHeight - frame.maxY, width: frame.width, height: frame.height)
