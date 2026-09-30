@@ -129,6 +129,16 @@ final class TilingGeometryTests: XCTestCase {
         XCTAssertFalse(TilingGeometry.shouldIgnoreMouseDown(at: CGPoint(x: 500, y: visible.minY - 1), screenVisibleFrame: visible, overInteractiveTilesWindow: false))
     }
 
+    func testStageManagerStripIgnoresTheEntireMouseSequence() {
+        let visible = CGRect(x: -1200, y: 0, width: 1200, height: 875)
+        XCTAssertTrue(TilingGeometry.shouldIgnoreMouseDown(
+            at: CGPoint(x: -1061, y: 400), screenVisibleFrame: visible, overInteractiveTilesWindow: false
+        ))
+        XCTAssertFalse(TilingGeometry.shouldIgnoreMouseDown(
+            at: CGPoint(x: -1060, y: 400), screenVisibleFrame: visible, overInteractiveTilesWindow: false
+        ))
+    }
+
     func testLinkedResizeIsContinuousAndMaintains15PixelGap() {
         let left = CGRect(x: 15, y: 15, width: 577.5, height: 870)
         let right = CGRect(x: 607.5, y: 15, width: 577.5, height: 870)

@@ -46,7 +46,8 @@ public enum TilingGeometry {
         screenVisibleFrame: CGRect,
         overInteractiveTilesWindow: Bool
     ) -> Bool {
-        point.y >= screenVisibleFrame.maxY || overInteractiveTilesWindow
+        point.x < screenVisibleFrame.minX + leftStageManagerInset ||
+            point.y >= screenVisibleFrame.maxY || overInteractiveTilesWindow
     }
 
     public static func arrange(existing: [LayoutSlot], inserting windowID: UInt32, in zone: SnapZone) -> [LayoutSlot] {
