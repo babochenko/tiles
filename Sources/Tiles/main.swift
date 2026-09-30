@@ -601,6 +601,32 @@ final class WindowManager {
             elements[windowID] = element
         }
 
+        // Some applications, notably Safari, do not expose enough metadata on
+        // every AX window for the CG/AX scan above to pair them reliably. The
+        // frontmost focused AX window is authoritative and necessarily belongs
+        // to the active Stage Manager group, so merge it into the snapshot.
+        if let app = NSWorkspace.shared.frontmostApplication,
+           app.processIdentifier != ownPID,
+           let focused = focusedWindow(),
+           let rawFrame = axFrame(of: focused.element) {
+            let frame = CoordinateGeometry.flipVertically(rawFrame, displayHeight: displayHeight)
+            if let screenIndex = ScreenGeometry.index(
+                containing: CGPoint(x: frame.midX, y: frame.midY), frames: screens.map(\.frame), tolerance: 0
+            ), !TilingGeometry.isCenteredInStageManagerStrip(
+                windowFrame: frame, screenFrame: screens[screenIndex].frame
+            ) {
+                let identity = WindowIdentity(windowID: focused.id, ownerPID: app.processIdentifier)
+                scanned[identity] = VisibleRuntimeWindow(
+                    identity: identity,
+                    frame: frame,
+                    element: focused.element,
+                    screenID: displayID(for: screens[screenIndex])
+                )
+                if !order.contains(identity) { order.insert(identity, at: 0) }
+                elements[focused.id] = focused.element
+            }
+        }
+
         visibleWindows = scanned
         visibleWindowOrder = order
         for screen in screens {
