@@ -660,16 +660,19 @@ final class WindowManager {
         let pid = app.processIdentifier
         guard let axFrame = axFrame(of: window) else { return nil }
         let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
+        var candidates: [(id: CGWindowID, frame: CGRect)] = []
         for info in windows where (info[kCGWindowOwnerPID as String] as? pid_t) == pid {
-            guard let bounds = info[kCGWindowBounds as String] as? NSDictionary,
+            guard (info[kCGWindowLayer as String] as? NSNumber)?.intValue == 0,
+                  let bounds = info[kCGWindowBounds as String] as? NSDictionary,
                   let number = info[kCGWindowNumber as String] as? NSNumber else { continue }
             var cgFrame = CGRect.zero
-            guard CGRectMakeWithDictionaryRepresentation(bounds, &cgFrame),
-                  VisibleWindowMatching.framesApproximatelyMatch(cgFrame, axFrame) else { continue }
-            let result = (id: CGWindowID(number.uint32Value), element: window)
-            return result
+            guard CGRectMakeWithDictionaryRepresentation(bounds, &cgFrame) else { continue }
+            candidates.append((CGWindowID(number.uint32Value), cgFrame))
         }
-        return nil
+        guard let index = VisibleWindowMatching.closestFrameIndex(
+            to: axFrame, candidates: candidates.map(\.frame)
+        ) else { return nil }
+        return (id: candidates[index].id, element: window)
     }
 
     private func visibleWindowElement(for id: CGWindowID, pid: pid_t, expectedFrame: CGRect) -> AXUIElement? {

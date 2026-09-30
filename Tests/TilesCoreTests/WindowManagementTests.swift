@@ -247,14 +247,14 @@ final class VisibleWindowMatchingTests: XCTestCase {
         ))
     }
 
-    func testNumberedStageManagerThumbnailIsRejectedWhenItsAXFrameDoesNotMatch() {
+    func testExactWindowNumberDoesNotDependOnDecorationFrameAgreement() {
         let thumbnailFrame = CGRect(x: 20, y: 300, width: 180, height: 120)
         let candidates = [
             VisibleWindowCandidate(windowID: 42, frame: expected, wasPreviouslyMatched: true)
         ]
-        XCTAssertNil(VisibleWindowMatching.candidateIndex(
+        XCTAssertEqual(VisibleWindowMatching.candidateIndex(
             for: 42, expectedFrame: thumbnailFrame, candidates: candidates
-        ))
+        ), 0)
     }
 
     func testNormalWindowServerDecorationDifferencesStillMatch() {
@@ -275,6 +275,16 @@ final class VisibleWindowMatchingTests: XCTestCase {
         XCTAssertNil(VisibleWindowMatching.candidateIndex(
             for: 42, expectedFrame: expected, candidates: candidates
         ))
+    }
+
+    func testClosestFrameSelectsFocusedWindowWhenWindowNumberIsUnavailable() {
+        let candidates = [
+            CGRect(x: 20, y: 300, width: 180, height: 120),
+            CGRect(x: 82, y: 76, width: 834, height: 638),
+            CGRect(x: 900, y: 100, width: 500, height: 500)
+        ]
+        XCTAssertEqual(VisibleWindowMatching.closestFrameIndex(to: expected, candidates: candidates), 1)
+        XCTAssertNil(VisibleWindowMatching.closestFrameIndex(to: expected, candidates: []))
     }
 
     func testUnnumberedWindowCanInitiallyMatchByFrame() {

@@ -262,7 +262,7 @@ public enum VisibleWindowMatching {
             return framesApproximatelyMatch(frame, expectedFrame, tolerance: frameTolerance)
         }
 
-        if let exact = candidates.firstIndex(where: { $0.windowID == windowID && framesMatch($0.frame) }) {
+        if let exact = candidates.firstIndex(where: { $0.windowID == windowID }) {
             return exact
         }
         if allowPreviousFrameMismatch, let retained = candidates.firstIndex(where: {
@@ -284,6 +284,17 @@ public enum VisibleWindowMatching {
             abs(lhs.minY - rhs.minY) < tolerance &&
             abs(lhs.width - rhs.width) < tolerance &&
             abs(lhs.height - rhs.height) < tolerance
+    }
+
+    public static func closestFrameIndex(to expectedFrame: CGRect, candidates: [CGRect]) -> Int? {
+        candidates.enumerated().min {
+            frameDistance($0.element, expectedFrame) < frameDistance($1.element, expectedFrame)
+        }?.offset
+    }
+
+    private static func frameDistance(_ lhs: CGRect, _ rhs: CGRect) -> CGFloat {
+        abs(lhs.minX - rhs.minX) + abs(lhs.minY - rhs.minY) +
+            abs(lhs.width - rhs.width) + abs(lhs.height - rhs.height)
     }
 }
 
