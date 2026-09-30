@@ -124,6 +124,73 @@ final class ScreenGeometryTests: XCTestCase {
     }
 }
 
+final class AutoTileGeometryTests: XCTestCase {
+    private let screen = CGRect(x: 0, y: 0, width: 1200, height: 900)
+
+    func testOneWindowUsesFullScreenLayout() {
+        let windows = [VisibleWindowGeometry(windowID: 1, frame: CGRect(x: 400, y: 200, width: 300, height: 400))]
+        XCTAssertEqual(AutoTileGeometry.placements(for: windows, screenFrames: [screen]), [
+            PlacedSlot(windowID: 1, start: 0, end: 6, screenID: 0)
+        ])
+    }
+
+    func testTwoWindowsAreOrderedByGeometricCenter() {
+        let windows = [
+            VisibleWindowGeometry(windowID: 2, frame: CGRect(x: 800, y: 100, width: 300, height: 500)),
+            VisibleWindowGeometry(windowID: 1, frame: CGRect(x: 100, y: 100, width: 300, height: 500))
+        ]
+        XCTAssertEqual(AutoTileGeometry.placements(for: windows, screenFrames: [screen]), [
+            PlacedSlot(windowID: 1, start: 0, end: 3, screenID: 0),
+            PlacedSlot(windowID: 2, start: 3, end: 6, screenID: 0)
+        ])
+    }
+
+    func testThreeWindowsUseThirds() {
+        let windows = [100, 500, 900].enumerated().map {
+            VisibleWindowGeometry(windowID: UInt32($0.offset + 1),
+                                  frame: CGRect(x: $0.element, y: 100, width: 200, height: 400))
+        }
+        let placements = AutoTileGeometry.placements(for: windows, screenFrames: [screen])
+        XCTAssertEqual(placements.map(\.start), [0, 2, 4])
+        XCTAssertEqual(placements.map(\.end), [2, 4, 6])
+    }
+
+    func testMoreThanThreeKeepsFrontmostInputWindows() {
+        let windows = [
+            VisibleWindowGeometry(windowID: 1, frame: CGRect(x: 900, y: 100, width: 100, height: 400)),
+            VisibleWindowGeometry(windowID: 2, frame: CGRect(x: 500, y: 100, width: 100, height: 400)),
+            VisibleWindowGeometry(windowID: 3, frame: CGRect(x: 100, y: 100, width: 100, height: 400)),
+            VisibleWindowGeometry(windowID: 4, frame: CGRect(x: 300, y: 100, width: 100, height: 400))
+        ]
+        let placements = AutoTileGeometry.placements(for: windows, screenFrames: [screen])
+        XCTAssertEqual(placements.map(\.windowID), [3, 2, 1])
+        XCTAssertFalse(placements.contains { $0.windowID == 4 })
+    }
+
+    func testWindowsAreAssignedIndependentlyByCenterOnEachScreen() {
+        let screens = [CGRect(x: -1200, y: 0, width: 1200, height: 900), screen]
+        let windows = [
+            VisibleWindowGeometry(windowID: 1, frame: CGRect(x: -900, y: 100, width: 300, height: 400)),
+            VisibleWindowGeometry(windowID: 2, frame: CGRect(x: 400, y: 100, width: 300, height: 400))
+        ]
+        XCTAssertEqual(AutoTileGeometry.placements(for: windows, screenFrames: screens), [
+            PlacedSlot(windowID: 1, start: 0, end: 6, screenID: 0),
+            PlacedSlot(windowID: 2, start: 0, end: 6, screenID: 1)
+        ])
+    }
+
+    func testWindowCrossingDisplaysUsesTheScreenContainingItsCenter() {
+        let screens = [CGRect(x: -1200, y: 0, width: 1200, height: 900), screen]
+        let window = VisibleWindowGeometry(windowID: 1, frame: CGRect(x: -100, y: 100, width: 400, height: 400))
+        XCTAssertEqual(AutoTileGeometry.placements(for: [window], screenFrames: screens).first?.screenID, 1)
+    }
+
+    func testZeroMaximumDisablesPlacement() {
+        let window = VisibleWindowGeometry(windowID: 1, frame: screen)
+        XCTAssertTrue(AutoTileGeometry.placements(for: [window], screenFrames: [screen], maximumWindowsPerScreen: 0).isEmpty)
+    }
+}
+
 final class LinkedResizeGeometryTests: XCTestCase {
     private let expectedLeft = CGRect(x: 0, y: 10, width: 100, height: 500)
     private let expectedRight = CGRect(x: 115, y: 10, width: 100, height: 500)

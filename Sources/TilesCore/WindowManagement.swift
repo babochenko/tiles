@@ -92,6 +92,52 @@ public enum ScreenGeometry {
     }
 }
 
+public struct VisibleWindowGeometry: Equatable {
+    public let windowID: UInt32
+    public let frame: CGRect
+
+    public init(windowID: UInt32, frame: CGRect) {
+        self.windowID = windowID
+        self.frame = frame
+    }
+}
+
+public enum AutoTileGeometry {
+    public static func placements(
+        for windows: [VisibleWindowGeometry],
+        screenFrames: [CGRect],
+        maximumWindowsPerScreen: Int = 3
+    ) -> [PlacedSlot<Int>] {
+        guard maximumWindowsPerScreen > 0 else { return [] }
+        var result: [PlacedSlot<Int>] = []
+        for (screenIndex, screenFrame) in screenFrames.enumerated() {
+            let selected = windows.filter {
+                screenFrame.contains(CGPoint(x: $0.frame.midX, y: $0.frame.midY))
+            }.prefix(maximumWindowsPerScreen).sorted {
+                if $0.frame.midX == $1.frame.midX {
+                    if $0.frame.midY == $1.frame.midY { return $0.windowID < $1.windowID }
+                    return $0.frame.midY > $1.frame.midY
+                }
+                return $0.frame.midX < $1.frame.midX
+            }
+            let boundaries: [Int]
+            switch selected.count {
+            case 1: boundaries = [0, 6]
+            case 2: boundaries = [0, 3, 6]
+            case 3: boundaries = [0, 2, 4, 6]
+            default: continue
+            }
+            result += selected.enumerated().map {
+                PlacedSlot(windowID: $0.element.windowID,
+                           start: boundaries[$0.offset],
+                           end: boundaries[$0.offset + 1],
+                           screenID: screenIndex)
+            }
+        }
+        return result
+    }
+}
+
 public enum LinkedResizeSource: Equatable {
     case left
     case right

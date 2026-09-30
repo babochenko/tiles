@@ -59,6 +59,51 @@ final class WindowManager {
         applyPaletteLayout(to: window, start: start, end: end, screen: screen)
     }
 
+    func tileVisibleWindows() {
+        let screens = NSScreen.screens
+        let displayHeight = screens.first?.frame.maxY ?? 0
+        let ownPID = ProcessInfo.processInfo.processIdentifier
+        let windowInfo = CGWindowListCopyWindowInfo(
+            [.optionOnScreenOnly, .excludeDesktopElements],
+            kCGNullWindowID
+        ) as? [[String: Any]] ?? []
+        var candidates: [VisibleWindowGeometry] = []
+
+        for info in windowInfo {
+            guard (info[kCGWindowLayer as String] as? NSNumber)?.intValue == 0,
+                  (info[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value != ownPID,
+                  (info[kCGWindowAlpha as String] as? NSNumber)?.doubleValue ?? 1 > 0,
+                  let number = info[kCGWindowNumber as String] as? NSNumber,
+                  let bounds = info[kCGWindowBounds as String] as? NSDictionary else { continue }
+            var quartzFrame = CGRect.zero
+            guard CGRectMakeWithDictionaryRepresentation(bounds, &quartzFrame) else { continue }
+            let frame = CoordinateGeometry.flipVertically(quartzFrame, displayHeight: displayHeight)
+            let windowID = CGWindowID(number.uint32Value)
+            guard let pid = info[kCGWindowOwnerPID as String] as? pid_t,
+                  let element = visibleWindowElement(for: windowID, pid: pid, expectedFrame: frame) else { continue }
+            elements[windowID] = element
+            candidates.append(VisibleWindowGeometry(windowID: windowID, frame: frame))
+        }
+
+        let placements = AutoTileGeometry.placements(for: candidates, screenFrames: screens.map(\.frame))
+        guard !placements.isEmpty else {
+            NSLog("Tiles: no visible standard windows found to tile.")
+            return
+        }
+        let affectedScreenIndices = Set(placements.map(\.screenID))
+        let affectedScreens = Set(affectedScreenIndices.map { screens[$0] })
+        let selectedWindowIDs = Set(placements.map(\.windowID))
+        slots.removeAll { affectedScreens.contains($0.screenID) || selectedWindowIDs.contains($0.windowID) }
+        slots += placements.map {
+            Slot(windowID: $0.windowID, start: $0.start, end: $0.end, screenID: screens[$0.screenID])
+        }
+        for screenIndex in affectedScreenIndices {
+            applyLayout(on: screens[screenIndex])
+        }
+        NSHapticFeedbackManager.defaultPerformer.perform(.alignment, performanceTime: .now)
+        NSLog("Tiles: tiled %d visible windows.", placements.count)
+    }
+
     func snapFocusedWindow(at point: CGPoint) {
         guard let window = focusedWindow() ?? lastExternalWindow else {
             NSLog("Tiles: no focused window found. Check Accessibility permission for Tiles/Terminal.")
@@ -357,6 +402,35 @@ final class WindowManager {
             return result
         }
         return nil
+    }
+
+    private func visibleWindowElement(for id: CGWindowID, pid: pid_t, expectedFrame: CGRect) -> AXUIElement? {
+        let axApp = AXUIElementCreateApplication(pid)
+        var value: CFTypeRef?
+        AXUIElementCopyAttributeValue(axApp, kAXWindowsAttribute as CFString, &value)
+        let displayHeight = NSScreen.screens.first?.frame.maxY ?? 0
+        for item in (value as? [AXUIElement] ?? []) {
+            var role: CFTypeRef?
+            AXUIElementCopyAttributeValue(item, kAXRoleAttribute as CFString, &role)
+            guard role as? String == kAXWindowRole else { continue }
+            var minimized: CFTypeRef?
+            AXUIElementCopyAttributeValue(item, kAXMinimizedAttribute as CFString, &minimized)
+            if (minimized as? NSNumber)?.boolValue == true { continue }
+
+            var number: CFTypeRef?
+            AXUIElementCopyAttributeValue(item, axWindowNumberAttribute as CFString, &number)
+            if let number = number as? NSNumber, number.uint32Value != id { continue }
+            guard let frame = axFrame(of: item).map({
+                CoordinateGeometry.flipVertically($0, displayHeight: displayHeight)
+            }), framesApproximatelyMatch(frame, expectedFrame) else { continue }
+            return item
+        }
+        return nil
+    }
+
+    private func framesApproximatelyMatch(_ lhs: CGRect, _ rhs: CGRect) -> Bool {
+        abs(lhs.minX - rhs.minX) < 12 && abs(lhs.minY - rhs.minY) < 12 &&
+            abs(lhs.width - rhs.width) < 12 && abs(lhs.height - rhs.height) < 12
     }
 
     private func axFrame(of window: AXUIElement) -> CGRect? {
@@ -662,6 +736,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         tileItem.submenu = tileMenu
         menu.addItem(tileItem)
+        let tileVisibleItem = menu.addItem(withTitle: "Tile visible windows", action: #selector(tileVisibleWindows), keyEquivalent: "")
+        tileVisibleItem.target = self
         let snapItem = menu.addItem(withTitle: "Snap focused window under cursor", action: #selector(snap), keyEquivalent: "")
         snapItem.target = self
         let accessibilityItem = menu.addItem(withTitle: "Accessibility status", action: #selector(accessibilityStatus), keyEquivalent: "")
@@ -677,6 +753,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func tileFromMenu(_ sender: NSMenuItem) {
         manager.tileFocusedWindow(start: sender.tag / 10, end: sender.tag % 10)
     }
+    @objc private func tileVisibleWindows() { manager.tileVisibleWindows() }
     @objc private func toggleLaunchAtStartup() {
         do {
             if SMAppService.mainApp.status == .enabled {
