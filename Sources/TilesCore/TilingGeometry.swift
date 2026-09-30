@@ -24,7 +24,7 @@ public enum TilingGeometry {
     public static let topSnapDistance: CGFloat = 30
     public static let leftStageManagerInset: CGFloat = 140
     public static let leftSnapWidth: CGFloat = sideSnapDistance * 4
-    public static let leftSnapHeight: CGFloat = sideSnapDistance * 2
+    public static let leftSnapHeight: CGFloat = sideSnapDistance * 4
 
     public static func snapZone(at point: CGPoint, in screen: CGRect) -> SnapZone? {
         if abs(point.y - screen.maxY) < topSnapDistance { return .top }
