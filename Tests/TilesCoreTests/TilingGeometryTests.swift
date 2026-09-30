@@ -5,9 +5,16 @@ import XCTest
 final class TilingGeometryTests: XCTestCase {
     private let screen = CGRect(x: 0, y: 0, width: 1200, height: 900)
 
-    func testSideZonesAre60PixelsAndTopZoneIs30Pixels() {
-        XCTAssertEqual(TilingGeometry.snapZone(at: CGPoint(x: 59, y: 400), in: screen), .left)
-        XCTAssertNil(TilingGeometry.snapZone(at: CGPoint(x: 60, y: 400), in: screen))
+    func testLeftZoneSkipsStageManagerStripAndUsesBottomCorner() {
+        XCTAssertNil(TilingGeometry.snapZone(at: CGPoint(x: 139, y: 30), in: screen))
+        XCTAssertEqual(TilingGeometry.snapZone(at: CGPoint(x: 140, y: 0), in: screen), .left)
+        XCTAssertEqual(TilingGeometry.snapZone(at: CGPoint(x: 259, y: 59), in: screen), .left)
+        XCTAssertNil(TilingGeometry.snapZone(at: CGPoint(x: 260, y: 30), in: screen))
+        XCTAssertNil(TilingGeometry.snapZone(at: CGPoint(x: 200, y: 60), in: screen))
+        XCTAssertNil(TilingGeometry.snapZone(at: CGPoint(x: 200, y: 400), in: screen))
+    }
+
+    func testRightZoneIs60PixelsAndTopZoneIs30Pixels() {
         XCTAssertEqual(TilingGeometry.snapZone(at: CGPoint(x: 600, y: 871), in: screen), .top)
         XCTAssertNil(TilingGeometry.snapZone(at: CGPoint(x: 600, y: 870), in: screen))
         XCTAssertEqual(TilingGeometry.snapZone(at: CGPoint(x: 1141, y: 400), in: screen), .right)
@@ -23,7 +30,7 @@ final class TilingGeometryTests: XCTestCase {
         let translated = CGRect(x: -1200, y: 200, width: 1200, height: 900)
         XCTAssertEqual(TilingGeometry.snapZone(at: CGPoint(x: -1199, y: 1099), in: translated), .top)
         XCTAssertEqual(TilingGeometry.snapZone(at: CGPoint(x: -1, y: 1099), in: translated), .top)
-        XCTAssertEqual(TilingGeometry.snapZone(at: CGPoint(x: -1199, y: 500), in: translated), .left)
+        XCTAssertEqual(TilingGeometry.snapZone(at: CGPoint(x: -1060, y: 200), in: translated), .left)
     }
 
     func testOneTwoAndThreeWindowLayouts() {
