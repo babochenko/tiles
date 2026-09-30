@@ -612,6 +612,8 @@ final class WindowManager {
         var value: CFTypeRef?
         AXUIElementCopyAttributeValue(axApp, kAXWindowsAttribute as CFString, &value)
         let displayHeight = NSScreen.screens.first?.frame.maxY ?? 0
+        let previous = visibleWindows[WindowIdentity(windowID: id, ownerPID: pid)]?.element
+        var candidates: [(element: AXUIElement, match: VisibleWindowCandidate)] = []
         for item in (value as? [AXUIElement] ?? []) {
             var role: CFTypeRef?
             AXUIElementCopyAttributeValue(item, kAXRoleAttribute as CFString, &role)
@@ -622,21 +624,19 @@ final class WindowManager {
 
             var number: CFTypeRef?
             AXUIElementCopyAttributeValue(item, axWindowNumberAttribute as CFString, &number)
-            if let number = number as? NSNumber {
-                if number.uint32Value == id { return item }
-                continue
-            }
-            guard let frame = axFrame(of: item).map({
+            let frame = axFrame(of: item).map({
                 CoordinateGeometry.flipVertically($0, displayHeight: displayHeight)
-            }), framesApproximatelyMatch(frame, expectedFrame) else { continue }
-            return item
+            })
+            candidates.append((item, VisibleWindowCandidate(
+                windowID: (number as? NSNumber)?.uint32Value,
+                frame: frame,
+                wasPreviouslyMatched: previous.map { CFEqual(item, $0) } ?? false
+            )))
         }
-        return nil
-    }
-
-    private func framesApproximatelyMatch(_ lhs: CGRect, _ rhs: CGRect) -> Bool {
-        abs(lhs.minX - rhs.minX) < 12 && abs(lhs.minY - rhs.minY) < 12 &&
-            abs(lhs.width - rhs.width) < 12 && abs(lhs.height - rhs.height) < 12
+        guard let index = VisibleWindowMatching.candidateIndex(
+            for: id, expectedFrame: expectedFrame, candidates: candidates.map(\.match)
+        ) else { return nil }
+        return candidates[index].element
     }
 
     private func axFrame(of window: AXUIElement) -> CGRect? {

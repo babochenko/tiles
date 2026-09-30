@@ -237,6 +237,39 @@ public enum StageGroupLayout {
     }
 }
 
+public struct VisibleWindowCandidate: Equatable {
+    public let windowID: UInt32?
+    public let frame: CGRect?
+    public let wasPreviouslyMatched: Bool
+
+    public init(windowID: UInt32?, frame: CGRect?, wasPreviouslyMatched: Bool) {
+        self.windowID = windowID
+        self.frame = frame
+        self.wasPreviouslyMatched = wasPreviouslyMatched
+    }
+}
+
+public enum VisibleWindowMatching {
+    public static func candidateIndex(
+        for windowID: UInt32,
+        expectedFrame: CGRect,
+        candidates: [VisibleWindowCandidate],
+        frameTolerance: CGFloat = 12
+    ) -> Int? {
+        if let exact = candidates.firstIndex(where: { $0.windowID == windowID }) { return exact }
+        if let retained = candidates.firstIndex(where: { $0.windowID == nil && $0.wasPreviouslyMatched }) {
+            return retained
+        }
+        return candidates.firstIndex {
+            guard $0.windowID == nil, let frame = $0.frame else { return false }
+            return abs(frame.minX - expectedFrame.minX) < frameTolerance &&
+                abs(frame.minY - expectedFrame.minY) < frameTolerance &&
+                abs(frame.width - expectedFrame.width) < frameTolerance &&
+                abs(frame.height - expectedFrame.height) < frameTolerance
+        }
+    }
+}
+
 public enum TilingState {
     public static func updatingForSnap<ScreenID: Hashable>(
         _ slots: [PlacedSlot<ScreenID>],

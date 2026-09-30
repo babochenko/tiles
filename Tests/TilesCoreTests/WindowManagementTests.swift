@@ -218,6 +218,48 @@ final class StageGroupLayoutTests: XCTestCase {
     }
 }
 
+final class VisibleWindowMatchingTests: XCTestCase {
+    private let expected = CGRect(x: 100, y: 100, width: 800, height: 600)
+
+    func testExactWindowNumberTakesPriority() {
+        let candidates = [
+            VisibleWindowCandidate(windowID: nil, frame: expected, wasPreviouslyMatched: true),
+            VisibleWindowCandidate(windowID: 42, frame: nil, wasPreviouslyMatched: false)
+        ]
+        XCTAssertEqual(VisibleWindowMatching.candidateIndex(
+            for: 42, expectedFrame: expected, candidates: candidates
+        ), 1)
+    }
+
+    func testPreviousUnnumberedWindowSurvivesFrameLagDuringDrag() {
+        let movingFrame = expected.offsetBy(dx: 500, dy: 0)
+        let candidates = [
+            VisibleWindowCandidate(windowID: nil, frame: movingFrame, wasPreviouslyMatched: true)
+        ]
+        XCTAssertEqual(VisibleWindowMatching.candidateIndex(
+            for: 42, expectedFrame: expected, candidates: candidates
+        ), 0)
+    }
+
+    func testDifferentExplicitWindowNumberCannotUsePreviousMatch() {
+        let candidates = [
+            VisibleWindowCandidate(windowID: 99, frame: expected, wasPreviouslyMatched: true)
+        ]
+        XCTAssertNil(VisibleWindowMatching.candidateIndex(
+            for: 42, expectedFrame: expected, candidates: candidates
+        ))
+    }
+
+    func testUnnumberedWindowCanInitiallyMatchByFrame() {
+        let candidates = [
+            VisibleWindowCandidate(windowID: nil, frame: expected.offsetBy(dx: 5, dy: -5), wasPreviouslyMatched: false)
+        ]
+        XCTAssertEqual(VisibleWindowMatching.candidateIndex(
+            for: 42, expectedFrame: expected, candidates: candidates
+        ), 0)
+    }
+}
+
 final class ScreenGeometryTests: XCTestCase {
     private let frames = [
         CGRect(x: -1200, y: 0, width: 1200, height: 900),
