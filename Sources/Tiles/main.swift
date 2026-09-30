@@ -17,6 +17,16 @@ private struct VisibleRuntimeWindow {
     let screenID: DisplayID
 }
 
+private enum WindowDropTarget: Equatable {
+    case zone(SnapZone)
+    case insertion(Int)
+}
+
+private struct ResolvedWindowDropTarget {
+    let target: WindowDropTarget
+    let indicatorFrame: CGRect?
+}
+
 private struct BoundaryDrag {
     let left: CGWindowID
     let right: CGWindowID
@@ -49,7 +59,7 @@ final class WindowManager {
     private var zoomPalette: ZoomPalettePanel?
     private var zoomPaletteWindowID: CGWindowID?
     private var cursorIsResizing = false
-    private var activeSnapZone: SnapZone?
+    private var activeDropTarget: WindowDropTarget?
     private var lastZoomCheck = Date.distantPast
     private var pendingSnap = false
     private var snapDragGesture = SnapDragGesture()
@@ -132,19 +142,33 @@ final class WindowManager {
         snap(window: window, at: point)
     }
 
-    private func snap(window: (id: CGWindowID, element: AXUIElement), at point: CGPoint) {
+    private func snap(
+        window: (id: CGWindowID, element: AXUIElement),
+        at point: CGPoint,
+        requestedTarget: WindowDropTarget? = nil
+    ) {
         refreshVisibleGroups()
         guard let screen = screen(containing: point),
               let context = stageGroups.activeContext(on: displayID(for: screen)),
               let identity = identity(for: window.id), stageGroups.permits(window: identity, in: context) else { return }
         elements[window.id] = window.element
-        let zone = TilingGeometry.snapZone(at: point, in: screen.frame) ?? (point.x < screen.frame.midX ? .left : .right)
-        let arranged = TilingGeometry.arrange(
-            existing: stageGroups.slots(in: context), inserting: window.id, in: zone
-        )
+        let fallback = WindowDropTarget.zone(point.x < screen.frame.midX ? .left : .right)
+        let target = requestedTarget ?? resolvedDropTarget(at: point, on: screen, in: context)?.target ?? fallback
+        let existing = stageGroups.slots(in: context)
+        let arranged: [LayoutSlot]
+        switch target {
+        case let .zone(zone):
+            arranged = TilingGeometry.arrange(existing: existing, inserting: window.id, in: zone)
+        case let .insertion(index):
+            arranged = TilingGeometry.arrange(existing: existing, inserting: window.id, at: index)
+        }
         stageGroups.setSlots(arranged, in: context)
         applyLayout(in: context, on: screen)
-        NSLog(zone == .top ? "Tiles: maximized window %u" : "Tiles: snapped window %u", window.id)
+        if case .zone(.top) = target {
+            NSLog("Tiles: maximized window %u", window.id)
+        } else {
+            NSLog("Tiles: snapped window %u", window.id)
+        }
     }
 
     private func applyLayout(in context: StageGroupContext<DisplayID>, on screen: NSScreen) {
@@ -295,12 +319,14 @@ final class WindowManager {
         layoutWidget?.close()
         layoutWidget = nil
         layoutWidgetScreen = nil
-        activeSnapZone = nil
+        activeDropTarget = nil
         let shouldSnap = snapDragGesture.mouseUp()
         if pendingSnap && shouldSnap {
-            if let screen = screen(containing: point), TilingGeometry.snapZone(at: point, in: screen.frame) != nil {
+            if let screen = screen(containing: point),
+               let context = stageGroups.activeContext(on: displayID(for: screen)),
+               let target = resolvedDropTarget(at: point, on: screen, in: context)?.target {
                 if let window = draggedWindow ?? focusedWindow() {
-                    snap(window: window, at: point)
+                    snap(window: window, at: point, requestedTarget: target)
                 } else {
                     NSLog("Tiles: reached an edge but could not identify the dragged window.")
                 }
@@ -401,20 +427,30 @@ final class WindowManager {
             previewScreen = nil
             layoutWidget?.close(); layoutWidget = nil
             layoutWidgetScreen = nil
-            activeSnapZone = nil
+            activeDropTarget = nil
             return
         }
-        let zone = TilingGeometry.snapZone(at: point, in: screen.frame)
-        if TilingGeometry.shouldHaptic(from: activeSnapZone, to: zone) {
+        let resolvedTarget = resolvedDropTarget(at: point, on: screen, in: context)
+        let dropTarget = resolvedTarget?.target
+        if activeDropTarget != dropTarget && (activeDropTarget != nil || dropTarget != nil) {
             NSHapticFeedbackManager.defaultPerformer.perform(.alignment, performanceTime: .now)
         }
-        activeSnapZone = zone
-        let current = stageGroups.slots(in: context).filter { $0.windowID != draggedWindow?.id }
+        activeDropTarget = dropTarget
+        let slots = stageGroups.slots(in: context)
+        var current = slots.filter { $0.windowID != draggedWindow?.id }
             .map { (CGFloat($0.start) / 6, CGFloat($0.end) / 6) }
         var future: (CGFloat, CGFloat)?
-        if let zone {
+        if case let .zone(zone) = dropTarget {
             let range = TilingGeometry.previewRange(existingCount: current.count, zone: zone)
             future = (range.lowerBound, range.upperBound)
+        } else if case let .insertion(index) = dropTarget {
+            let insertedWindowID = draggedWindow?.id ?? UInt32.max
+            let arranged = TilingGeometry.arrange(existing: slots, inserting: insertedWindowID, at: index)
+            current = arranged.filter { $0.windowID != insertedWindowID }
+                .map { (CGFloat($0.start) / 6, CGFloat($0.end) / 6) }
+            if let inserted = arranged.first(where: { $0.windowID == insertedWindowID }) {
+                future = (CGFloat(inserted.start) / 6, CGFloat(inserted.end) / 6)
+            }
         }
         if layoutWidgetScreen != screen {
             layoutWidget?.close()
@@ -426,17 +462,22 @@ final class WindowManager {
         }
         layoutWidget?.show(on: screen, current: current, future: future)
 
-        guard let zone else {
+        guard let resolvedTarget else {
             preview?.close(); preview = nil
             previewScreen = nil
             return
         }
 
-        let target = OverlayGeometry.snapPreviewFrame(
-            existingCount: current.count,
-            zone: zone,
-            visibleFrame: screen.visibleFrame
-        )
+        let target: CGRect
+        switch resolvedTarget.target {
+        case let .zone(zone):
+            target = OverlayGeometry.snapPreviewFrame(
+                existingCount: current.count, zone: zone, visibleFrame: screen.visibleFrame
+            )
+        case .insertion:
+            guard let indicatorFrame = resolvedTarget.indicatorFrame else { return }
+            target = indicatorFrame
+        }
         if previewScreen != screen {
             preview?.close()
             preview = nil
@@ -446,6 +487,27 @@ final class WindowManager {
             previewScreen = screen
         }
         preview?.show(frame: target)
+    }
+
+    private func resolvedDropTarget(
+        at point: CGPoint,
+        on screen: NSScreen,
+        in context: StageGroupContext<DisplayID>
+    ) -> ResolvedWindowDropTarget? {
+        if let zone = TilingGeometry.snapZone(at: point, in: screen.frame) {
+            return ResolvedWindowDropTarget(target: .zone(zone), indicatorFrame: nil)
+        }
+        let slots = stageGroups.slots(in: context).sorted { $0.start < $1.start }
+        if slots.count >= 3, !slots.contains(where: { $0.windowID == draggedWindow?.id }) { return nil }
+        let orderedFrames = slots.map {
+            TilingGeometry.frame(for: $0, in: screen.visibleFrame)
+        }
+        guard let insertion = TilingGeometry.insertionTarget(at: point, orderedFrames: orderedFrames) else {
+            return nil
+        }
+        return ResolvedWindowDropTarget(
+            target: .insertion(insertion.index), indicatorFrame: insertion.indicatorFrame
+        )
     }
 
     private func updateZoomPalette() {
@@ -560,7 +622,7 @@ final class WindowManager {
     private func closeSnapOverlays() {
         preview?.close(); preview = nil; previewScreen = nil
         layoutWidget?.close(); layoutWidget = nil; layoutWidgetScreen = nil
-        activeSnapZone = nil
+        activeDropTarget = nil
     }
 
     private func displayID(for screen: NSScreen) -> DisplayID {

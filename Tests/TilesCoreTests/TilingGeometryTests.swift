@@ -71,6 +71,62 @@ final class TilingGeometryTests: XCTestCase {
         ])
     }
 
+    func testWindowCanBeInsertedAtEveryPositionAroundTwoWindows() {
+        let existing = [
+            LayoutSlot(windowID: 1, start: 0, end: 3),
+            LayoutSlot(windowID: 2, start: 3, end: 6)
+        ]
+        XCTAssertEqual(TilingGeometry.arrange(existing: existing, inserting: 3, at: 0).map(\.windowID), [3, 1, 2])
+        XCTAssertEqual(TilingGeometry.arrange(existing: existing, inserting: 3, at: 1).map(\.windowID), [1, 3, 2])
+        XCTAssertEqual(TilingGeometry.arrange(existing: existing, inserting: 3, at: 2).map(\.windowID), [1, 2, 3])
+    }
+
+    func testInsertingBetweenTwoWindowsRedistributesAllThreeIntoThirds() {
+        let existing = [
+            LayoutSlot(windowID: 1, start: 0, end: 3),
+            LayoutSlot(windowID: 2, start: 3, end: 6)
+        ]
+        XCTAssertEqual(TilingGeometry.arrange(existing: existing, inserting: 3, at: 1), [
+            LayoutSlot(windowID: 1, start: 0, end: 2),
+            LayoutSlot(windowID: 3, start: 2, end: 4),
+            LayoutSlot(windowID: 2, start: 4, end: 6)
+        ])
+    }
+
+    func testReinsertingAnExistingWindowAdjustsItsOriginalIndex() {
+        let existing = [
+            LayoutSlot(windowID: 1, start: 0, end: 2),
+            LayoutSlot(windowID: 2, start: 2, end: 4),
+            LayoutSlot(windowID: 3, start: 4, end: 6)
+        ]
+        XCTAssertEqual(TilingGeometry.arrange(existing: existing, inserting: 3, at: 1).map(\.windowID), [1, 3, 2])
+        XCTAssertEqual(TilingGeometry.arrange(existing: existing, inserting: 1, at: 2).map(\.windowID), [2, 1, 3])
+    }
+
+    func testInsertionTargetCoversOnlyTheStripBetweenWindows() {
+        let frames = [
+            CGRect(x: 15, y: 15, width: 577.5, height: 870),
+            CGRect(x: 607.5, y: 15, width: 577.5, height: 870)
+        ]
+        let target = TilingGeometry.insertionTarget(at: CGPoint(x: 600, y: 400), orderedFrames: frames)
+        XCTAssertEqual(target?.index, 1)
+        XCTAssertEqual(target?.indicatorFrame, CGRect(x: 596, y: 15, width: 8, height: 870))
+        XCTAssertNil(TilingGeometry.insertionTarget(at: CGPoint(x: 569, y: 400), orderedFrames: frames))
+        XCTAssertNil(TilingGeometry.insertionTarget(at: CGPoint(x: 600, y: 900), orderedFrames: frames))
+    }
+
+    func testInsertionTargetSelectsTheCorrectDividerInThreeWindowLayout() {
+        let frames = [0, 2, 4].map {
+            TilingGeometry.frame(for: LayoutSlot(windowID: UInt32($0), start: $0, end: $0 + 2), in: screen)
+        }
+        XCTAssertEqual(TilingGeometry.insertionTarget(
+            at: CGPoint(x: 400, y: 450), orderedFrames: frames
+        )?.index, 1)
+        XCTAssertEqual(TilingGeometry.insertionTarget(
+            at: CGPoint(x: 800, y: 450), orderedFrames: frames
+        )?.index, 2)
+    }
+
     func testMarginsAre15AtScreenEdgesAnd15BetweenWindows() {
         let left = TilingGeometry.frame(for: LayoutSlot(windowID: 1, start: 0, end: 3), in: screen)
         let right = TilingGeometry.frame(for: LayoutSlot(windowID: 2, start: 3, end: 6), in: screen)

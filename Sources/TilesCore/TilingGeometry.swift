@@ -18,6 +18,16 @@ public struct LayoutSlot: Equatable {
     }
 }
 
+public struct LayoutInsertionTarget: Equatable {
+    public let index: Int
+    public let indicatorFrame: CGRect
+
+    public init(index: Int, indicatorFrame: CGRect) {
+        self.index = index
+        self.indicatorFrame = indicatorFrame
+    }
+}
+
 public enum TilingGeometry {
     public static let margin: CGFloat = 15
     public static let sideSnapDistance: CGFloat = 60
@@ -25,6 +35,8 @@ public enum TilingGeometry {
     public static let leftStageManagerInset: CGFloat = 140
     public static let leftSnapWidth: CGFloat = sideSnapDistance * 4
     public static let leftSnapHeight: CGFloat = sideSnapDistance * 4
+    public static let insertionHitDistance: CGFloat = 30
+    public static let insertionIndicatorWidth: CGFloat = 8
 
     public static func snapZone(at point: CGPoint, in screen: CGRect) -> SnapZone? {
         if abs(point.y - screen.maxY) < topSnapDistance { return .top }
@@ -57,16 +69,68 @@ public enum TilingGeometry {
         while ordered.count >= 3 {
             ordered.remove(at: zone == .left ? 0 : ordered.count - 1)
         }
-        let placeholder = LayoutSlot(windowID: windowID, start: 0, end: 0)
-        if zone == .left { ordered.insert(placeholder, at: 0) } else { ordered.append(placeholder) }
-
-        if ordered.count == 1 {
+        if ordered.isEmpty {
             return [LayoutSlot(windowID: windowID, start: zone == .left ? 0 : 3, end: zone == .left ? 3 : 6)]
         }
+        return arrange(
+            existing: ordered,
+            inserting: windowID,
+            at: zone == .left ? 0 : ordered.count
+        )
+    }
+
+    public static func arrange(existing: [LayoutSlot], inserting windowID: UInt32, at index: Int) -> [LayoutSlot] {
+        var ordered = existing.sorted { $0.start < $1.start }
+        let oldIndex = ordered.firstIndex { $0.windowID == windowID }
+        ordered.removeAll { $0.windowID == windowID }
+        var insertionIndex = min(max(0, index - ((oldIndex.map { $0 < index }) == true ? 1 : 0)), ordered.count)
+
+        while ordered.count >= 3 {
+            if insertionIndex <= ordered.count / 2 {
+                ordered.removeLast()
+            } else {
+                ordered.removeFirst()
+                insertionIndex -= 1
+            }
+        }
+        ordered.insert(LayoutSlot(windowID: windowID, start: 0, end: 0), at: insertionIndex)
+
+        if ordered.count == 1 { return [LayoutSlot(windowID: windowID, start: 0, end: 6)] }
         let boundaries = ordered.count == 2 ? [0, 3, 6] : [0, 2, 4, 6]
         return ordered.enumerated().map {
             LayoutSlot(windowID: $0.element.windowID, start: boundaries[$0.offset], end: boundaries[$0.offset + 1])
         }
+    }
+
+    public static func insertionTarget(
+        at point: CGPoint,
+        orderedFrames: [CGRect],
+        hitDistance: CGFloat = insertionHitDistance,
+        indicatorWidth: CGFloat = insertionIndicatorWidth
+    ) -> LayoutInsertionTarget? {
+        guard orderedFrames.count >= 2 else { return nil }
+        var nearest: (distance: CGFloat, target: LayoutInsertionTarget)?
+        for index in 1..<orderedFrames.count {
+            let left = orderedFrames[index - 1]
+            let right = orderedFrames[index]
+            let minY = max(left.minY, right.minY)
+            let maxY = min(left.maxY, right.maxY)
+            guard minY < maxY, point.y >= minY, point.y <= maxY else { continue }
+            let dividerX = (left.maxX + right.minX) / 2
+            let distance = abs(point.x - dividerX)
+            guard distance <= hitDistance,
+                  distance < (nearest?.distance ?? .greatestFiniteMagnitude) else { continue }
+            nearest = (distance, LayoutInsertionTarget(
+                index: index,
+                indicatorFrame: CGRect(
+                    x: dividerX - indicatorWidth / 2,
+                    y: minY,
+                    width: indicatorWidth,
+                    height: maxY - minY
+                )
+            ))
+        }
+        return nearest?.target
     }
 
     public static func frame(for slot: LayoutSlot, in visibleFrame: CGRect) -> CGRect {
