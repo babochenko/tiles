@@ -696,7 +696,10 @@ final class WindowManager {
             )))
         }
         guard let index = VisibleWindowMatching.candidateIndex(
-            for: id, expectedFrame: expectedFrame, candidates: candidates.map(\.match)
+            for: id,
+            expectedFrame: expectedFrame,
+            candidates: candidates.map(\.match),
+            allowPreviousFrameMismatch: snapDragGesture.isActive && draggedWindow?.id == id
         ) else { return nil }
         return candidates[index].element
     }

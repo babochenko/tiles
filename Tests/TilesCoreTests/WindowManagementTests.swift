@@ -224,7 +224,7 @@ final class VisibleWindowMatchingTests: XCTestCase {
     func testExactWindowNumberTakesPriority() {
         let candidates = [
             VisibleWindowCandidate(windowID: nil, frame: expected, wasPreviouslyMatched: true),
-            VisibleWindowCandidate(windowID: 42, frame: nil, wasPreviouslyMatched: false)
+            VisibleWindowCandidate(windowID: 42, frame: expected, wasPreviouslyMatched: false)
         ]
         XCTAssertEqual(VisibleWindowMatching.candidateIndex(
             for: 42, expectedFrame: expected, candidates: candidates
@@ -237,8 +237,24 @@ final class VisibleWindowMatchingTests: XCTestCase {
             VisibleWindowCandidate(windowID: nil, frame: movingFrame, wasPreviouslyMatched: true)
         ]
         XCTAssertEqual(VisibleWindowMatching.candidateIndex(
-            for: 42, expectedFrame: expected, candidates: candidates
+            for: 42,
+            expectedFrame: expected,
+            candidates: candidates,
+            allowPreviousFrameMismatch: true
         ), 0)
+        XCTAssertNil(VisibleWindowMatching.candidateIndex(
+            for: 42, expectedFrame: expected, candidates: candidates
+        ))
+    }
+
+    func testNumberedStageManagerThumbnailIsRejectedWhenItsAXFrameDoesNotMatch() {
+        let thumbnailFrame = CGRect(x: 20, y: 300, width: 180, height: 120)
+        let candidates = [
+            VisibleWindowCandidate(windowID: 42, frame: expected, wasPreviouslyMatched: true)
+        ]
+        XCTAssertNil(VisibleWindowMatching.candidateIndex(
+            for: 42, expectedFrame: thumbnailFrame, candidates: candidates
+        ))
     }
 
     func testDifferentExplicitWindowNumberCannotUsePreviousMatch() {
