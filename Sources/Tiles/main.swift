@@ -51,6 +51,7 @@ final class WindowManager {
     private var boundaryDrag: BoundaryDrag?
     private var boundarySettlePending = false
     private var draggedWindow: (id: CGWindowID, element: AXUIElement)?
+    private var resolvedDraggedWindowAfterMovement = false
     private var overlay: BoundaryOverlay?
     private var preview: SnapPreviewPanel?
     private var previewScreen: NSScreen?
@@ -278,6 +279,7 @@ final class WindowManager {
             pendingSnap = true
             snapDragGesture.mouseDown(at: point)
             draggedWindow = focusedWindow()
+            resolvedDraggedWindowAfterMovement = false
         }
     }
 
@@ -286,7 +288,10 @@ final class WindowManager {
             guard snapDragGesture.mouseDragged(to: point) else { return }
             // On mouse-down the clicked application may not yet have become
             // frontmost. Resolve it again once the system starts the drag.
-            draggedWindow = focusedWindow() ?? draggedWindow
+            if !resolvedDraggedWindowAfterMovement {
+                draggedWindow = focusedWindow() ?? draggedWindow
+                resolvedDraggedWindowAfterMovement = true
+            }
             updatePreview(at: point)
             return
         }
@@ -334,6 +339,7 @@ final class WindowManager {
         }
         pendingSnap = false
         draggedWindow = nil
+        resolvedDraggedWindowAfterMovement = false
         boundaryDrag = nil
         if cursorIsResizing { NSCursor.arrow.set(); cursorIsResizing = false }
     }
@@ -605,9 +611,10 @@ final class WindowManager {
         // every AX window for the CG/AX scan above to pair them reliably. The
         // frontmost focused AX window is authoritative and necessarily belongs
         // to the active Stage Manager group, so merge it into the snapshot.
+        let focusedForSnapshot = resolvedDraggedWindowAfterMovement ? draggedWindow : focusedWindow()
         if let app = NSWorkspace.shared.frontmostApplication,
            app.processIdentifier != ownPID,
-           let focused = focusedWindow(),
+           let focused = focusedForSnapshot,
            let rawFrame = axFrame(of: focused.element) {
             let frame = CoordinateGeometry.flipVertically(rawFrame, displayHeight: displayHeight)
             if let screenIndex = ScreenGeometry.index(
