@@ -8,10 +8,10 @@ final class TilingGeometryTests: XCTestCase {
     func testLeftZoneSkipsStageManagerStripAndUsesBottomCorner() {
         XCTAssertNil(TilingGeometry.snapZone(at: CGPoint(x: 139, y: 30), in: screen))
         XCTAssertEqual(TilingGeometry.snapZone(at: CGPoint(x: 140, y: 0), in: screen), .left)
-        XCTAssertEqual(TilingGeometry.snapZone(at: CGPoint(x: 259, y: 59), in: screen), .left)
-        XCTAssertNil(TilingGeometry.snapZone(at: CGPoint(x: 260, y: 30), in: screen))
-        XCTAssertNil(TilingGeometry.snapZone(at: CGPoint(x: 200, y: 60), in: screen))
-        XCTAssertNil(TilingGeometry.snapZone(at: CGPoint(x: 200, y: 400), in: screen))
+        XCTAssertEqual(TilingGeometry.snapZone(at: CGPoint(x: 379, y: 119), in: screen), .left)
+        XCTAssertNil(TilingGeometry.snapZone(at: CGPoint(x: 380, y: 60), in: screen))
+        XCTAssertNil(TilingGeometry.snapZone(at: CGPoint(x: 200, y: 120), in: screen))
+        XCTAssertNil(TilingGeometry.snapZone(at: CGPoint(x: 300, y: 400), in: screen))
     }
 
     func testRightZoneIs60PixelsAndTopZoneIs30Pixels() {
