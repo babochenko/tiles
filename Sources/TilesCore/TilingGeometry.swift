@@ -28,6 +28,16 @@ public struct LayoutInsertionTarget: Equatable {
     }
 }
 
+public struct LayoutReplacementTarget: Equatable {
+    public let windowID: UInt32
+    public let frame: CGRect
+
+    public init(windowID: UInt32, frame: CGRect) {
+        self.windowID = windowID
+        self.frame = frame
+    }
+}
+
 public enum TilingGeometry {
     public static let margin: CGFloat = 15
     public static let sideSnapDistance: CGFloat = 60
@@ -37,6 +47,7 @@ public enum TilingGeometry {
     public static let leftSnapHeight: CGFloat = sideSnapDistance * 4
     public static let insertionHitDistance: CGFloat = 30
     public static let insertionIndicatorWidth: CGFloat = 8
+    public static let replacementTargetFraction: CGFloat = 0.25
 
     public static func snapZone(at point: CGPoint, in screen: CGRect) -> SnapZone? {
         if abs(point.y - screen.maxY) < topSnapDistance { return .top }
@@ -135,6 +146,40 @@ public enum TilingGeometry {
             ))
         }
         return nearest?.target
+    }
+
+    public static func replacementTarget(
+        at point: CGPoint,
+        slots: [LayoutSlot],
+        visibleFrame: CGRect,
+        targetFraction: CGFloat = replacementTargetFraction
+    ) -> LayoutReplacementTarget? {
+        for slot in slots.sorted(by: { $0.start < $1.start }) {
+            let slotFrame = frame(for: slot, in: visibleFrame)
+            let fraction = min(1, max(0, targetFraction))
+            let targetFrame = CGRect(
+                x: slotFrame.minX,
+                y: slotFrame.maxY - slotFrame.height * fraction,
+                width: slotFrame.width,
+                height: slotFrame.height * fraction
+            )
+            if targetFrame.contains(point) {
+                return LayoutReplacementTarget(windowID: slot.windowID, frame: slotFrame)
+            }
+        }
+        return nil
+    }
+
+    public static func replacing(
+        existing: [LayoutSlot],
+        window targetWindowID: UInt32,
+        with replacementWindowID: UInt32
+    ) -> [LayoutSlot] {
+        guard existing.contains(where: { $0.windowID == targetWindowID }) else { return existing }
+        return existing.filter { $0.windowID != replacementWindowID }.map {
+            guard $0.windowID == targetWindowID else { return $0 }
+            return LayoutSlot(windowID: replacementWindowID, start: $0.start, end: $0.end)
+        }
     }
 
     public static func frame(for slot: LayoutSlot, in visibleFrame: CGRect) -> CGRect {

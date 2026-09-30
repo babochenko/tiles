@@ -20,11 +20,12 @@ private struct VisibleRuntimeWindow {
 private enum WindowDropTarget: Equatable {
     case zone(SnapZone)
     case insertion(Int)
+    case replacement(UInt32)
 }
 
 private struct ResolvedWindowDropTarget {
     let target: WindowDropTarget
-    let indicatorFrame: CGRect?
+    let previewFrame: CGRect?
 }
 
 private struct BoundaryDrag {
@@ -157,14 +158,25 @@ final class WindowManager {
         let target = requestedTarget ?? resolvedDropTarget(at: point, on: screen, in: context)?.target ?? fallback
         let existing = stageGroups.slots(in: context)
         let arranged: [LayoutSlot]
+        var replacedWindowID: CGWindowID?
         switch target {
         case let .zone(zone):
             arranged = TilingGeometry.arrange(existing: existing, inserting: window.id, in: zone)
         case let .insertion(index):
             arranged = TilingGeometry.arrange(existing: existing, inserting: window.id, at: index)
+        case let .replacement(targetWindowID):
+            guard existing.contains(where: { $0.windowID == targetWindowID }) else { return }
+            arranged = TilingGeometry.replacing(
+                existing: existing, window: targetWindowID, with: window.id
+            )
+            replacedWindowID = targetWindowID
         }
         stageGroups.setSlots(arranged, in: context)
-        applyLayout(in: context, on: screen)
+        let appliedWindowIDs = applyLayout(in: context, on: screen)
+        if let replacedWindowID, replacedWindowID != window.id, appliedWindowIDs.contains(window.id) {
+            minimizeWindow(replacedWindowID, in: context)
+            expected.removeValue(forKey: replacedWindowID)
+        }
         if case .zone(.top) = target {
             NSLog("Tiles: maximized window %u", window.id)
         } else {
@@ -172,15 +184,19 @@ final class WindowManager {
         }
     }
 
-    private func applyLayout(in context: StageGroupContext<DisplayID>, on screen: NSScreen) {
+    @discardableResult
+    private func applyLayout(in context: StageGroupContext<DisplayID>, on screen: NSScreen) -> Set<CGWindowID> {
         let visibleIDs = Set(context.visibleWindows.map(\.windowID))
         let assignments = StageGroupLayout.assignments(
             slots: stageGroups.slots(in: context), visibleWindowIDs: visibleIDs, visibleFrame: screen.visibleFrame
         )
+        var appliedWindowIDs: Set<CGWindowID> = []
         for assignment in assignments {
             guard setFrame(assignment.frame, for: assignment.windowID, in: context) else { continue }
             expected[assignment.windowID] = assignment.frame
+            appliedWindowIDs.insert(assignment.windowID)
         }
+        return appliedWindowIDs
     }
 
     private func reconcileAndShowBoundary() {
@@ -457,6 +473,16 @@ final class WindowManager {
             if let inserted = arranged.first(where: { $0.windowID == insertedWindowID }) {
                 future = (CGFloat(inserted.start) / 6, CGFloat(inserted.end) / 6)
             }
+        } else if case let .replacement(targetWindowID) = dropTarget {
+            let insertedWindowID = draggedWindow?.id ?? UInt32.max
+            let arranged = TilingGeometry.replacing(
+                existing: slots, window: targetWindowID, with: insertedWindowID
+            )
+            current = arranged.filter { $0.windowID != insertedWindowID }
+                .map { (CGFloat($0.start) / 6, CGFloat($0.end) / 6) }
+            if let inserted = arranged.first(where: { $0.windowID == insertedWindowID }) {
+                future = (CGFloat(inserted.start) / 6, CGFloat(inserted.end) / 6)
+            }
         }
         if layoutWidgetScreen != screen {
             layoutWidget?.close()
@@ -480,9 +506,9 @@ final class WindowManager {
             target = OverlayGeometry.snapPreviewFrame(
                 existingCount: current.count, zone: zone, visibleFrame: screen.visibleFrame
             )
-        case .insertion:
-            guard let indicatorFrame = resolvedTarget.indicatorFrame else { return }
-            target = indicatorFrame
+        case .insertion(_), .replacement(_):
+            guard let previewFrame = resolvedTarget.previewFrame else { return }
+            target = previewFrame
         }
         if previewScreen != screen {
             preview?.close()
@@ -501,19 +527,25 @@ final class WindowManager {
         in context: StageGroupContext<DisplayID>
     ) -> ResolvedWindowDropTarget? {
         if let zone = TilingGeometry.snapZone(at: point, in: screen.frame) {
-            return ResolvedWindowDropTarget(target: .zone(zone), indicatorFrame: nil)
+            return ResolvedWindowDropTarget(target: .zone(zone), previewFrame: nil)
         }
         let slots = stageGroups.slots(in: context).sorted { $0.start < $1.start }
-        if slots.count >= 3, !slots.contains(where: { $0.windowID == draggedWindow?.id }) { return nil }
+        let draggedWindowID = draggedWindow?.id
+        let draggedWindowIsManaged = slots.contains { $0.windowID == draggedWindowID }
         let orderedFrames = slots.map {
             TilingGeometry.frame(for: $0, in: screen.visibleFrame)
         }
-        guard let insertion = TilingGeometry.insertionTarget(at: point, orderedFrames: orderedFrames) else {
-            return nil
+        if slots.count < 3 || draggedWindowIsManaged,
+           let insertion = TilingGeometry.insertionTarget(at: point, orderedFrames: orderedFrames) {
+            return ResolvedWindowDropTarget(
+                target: .insertion(insertion.index), previewFrame: insertion.indicatorFrame
+            )
         }
-        return ResolvedWindowDropTarget(
-            target: .insertion(insertion.index), indicatorFrame: insertion.indicatorFrame
-        )
+        guard !draggedWindowIsManaged,
+              let replacement = TilingGeometry.replacementTarget(
+                  at: point, slots: slots, visibleFrame: screen.visibleFrame
+              ) else { return nil }
+        return ResolvedWindowDropTarget(target: .replacement(replacement.windowID), previewFrame: replacement.frame)
     }
 
     private func updateZoomPalette() {
@@ -791,6 +823,19 @@ final class WindowManager {
             return true
         }
         return false
+    }
+
+    private func minimizeWindow(_ id: CGWindowID, in context: StageGroupContext<DisplayID>) {
+        guard stageGroups.isCurrent(context),
+              let identity = identity(for: id),
+              stageGroups.permits(window: identity, in: context),
+              let item = elements[id] else { return }
+        let result = AXUIElementSetAttributeValue(
+            item, kAXMinimizedAttribute as CFString, kCFBooleanTrue
+        )
+        if result != .success {
+            NSLog("Tiles: macOS rejected minimizing displaced window %u (%d).", id, result.rawValue)
+        }
     }
 
     private func setFrame(_ frame: CGRect, on item: AXUIElement) {

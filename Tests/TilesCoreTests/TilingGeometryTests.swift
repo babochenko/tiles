@@ -127,6 +127,39 @@ final class TilingGeometryTests: XCTestCase {
         )?.index, 2)
     }
 
+    func testReplacementTargetUsesTopQuarterAndHighlightsExactSlotFrame() {
+        let slots = [
+            LayoutSlot(windowID: 1, start: 0, end: 3),
+            LayoutSlot(windowID: 2, start: 3, end: 6)
+        ]
+        let rightFrame = TilingGeometry.frame(for: slots[1], in: screen)
+        let target = TilingGeometry.replacementTarget(
+            at: CGPoint(x: rightFrame.midX, y: rightFrame.maxY - 20),
+            slots: slots,
+            visibleFrame: screen
+        )
+        XCTAssertEqual(target, LayoutReplacementTarget(windowID: 2, frame: rightFrame))
+        XCTAssertNil(TilingGeometry.replacementTarget(
+            at: CGPoint(x: rightFrame.midX, y: rightFrame.midY),
+            slots: slots,
+            visibleFrame: screen
+        ))
+    }
+
+    func testReplacingWindowPreservesExactSlotAndOtherRelationships() {
+        let existing = [
+            LayoutSlot(windowID: 1, start: 0, end: 2),
+            LayoutSlot(windowID: 2, start: 2, end: 4),
+            LayoutSlot(windowID: 3, start: 4, end: 6)
+        ]
+        XCTAssertEqual(TilingGeometry.replacing(existing: existing, window: 2, with: 9), [
+            LayoutSlot(windowID: 1, start: 0, end: 2),
+            LayoutSlot(windowID: 9, start: 2, end: 4),
+            LayoutSlot(windowID: 3, start: 4, end: 6)
+        ])
+        XCTAssertEqual(TilingGeometry.replacing(existing: existing, window: 99, with: 9), existing)
+    }
+
     func testMarginsAre15AtScreenEdgesAnd15BetweenWindows() {
         let left = TilingGeometry.frame(for: LayoutSlot(windowID: 1, start: 0, end: 3), in: screen)
         let right = TilingGeometry.frame(for: LayoutSlot(windowID: 2, start: 3, end: 6), in: screen)
