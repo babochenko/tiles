@@ -131,6 +131,44 @@ final class StageGroupStoreTests: XCTestCase {
         XCTAssertEqual(store.slots(in: restored), [LayoutSlot(windowID: 1, start: 0, end: 3)])
     }
 
+    func testReturningGroupRestoresLayoutWhenUnmanagedWindowSignatureChanged() throws {
+        let extras = (5...9).map { WindowIdentity(windowID: UInt32($0), ownerPID: Int32($0 * 10)) }
+        let newExtras = (10...13).map { WindowIdentity(windowID: UInt32($0), ownerPID: Int32($0 * 10)) }
+        var store = StageGroupStore<Int>(requiredStableSamples: 1)
+        let first = try active(store.observe(screenID: 1, visibleWindows: Set([a, b] + extras)))
+        store.setSlots([
+            LayoutSlot(windowID: a.windowID, start: 0, end: 3),
+            LayoutSlot(windowID: b.windowID, start: 3, end: 6)
+        ], in: first)
+        _ = store.observe(screenID: 1, visibleWindows: [c, d])
+
+        let restored = try active(store.observe(screenID: 1, visibleWindows: Set([a, b] + newExtras)))
+        XCTAssertEqual(restored.key.groupID, first.key.groupID)
+        XCTAssertEqual(store.slots(in: restored).map(\.windowID), [a.windowID, b.windowID])
+    }
+
+    func testLayoutBasedRestoreRequiresAllSlottedWindows() throws {
+        var store = StageGroupStore<Int>(requiredStableSamples: 1)
+        let first = try active(store.observe(screenID: 1, visibleWindows: [a, b]))
+        store.setSlots([
+            LayoutSlot(windowID: a.windowID, start: 0, end: 3),
+            LayoutSlot(windowID: b.windowID, start: 3, end: 6)
+        ], in: first)
+        let partial = try active(store.observe(screenID: 1, visibleWindows: [a, c, d]))
+        XCTAssertNotEqual(partial.key.groupID, first.key.groupID)
+        XCTAssertTrue(store.slots(in: partial).isEmpty)
+    }
+
+    func testLayoutBasedRestoreRejectsReusedWindowIDFromAnotherProcess() throws {
+        var store = StageGroupStore<Int>(requiredStableSamples: 1)
+        let first = try active(store.observe(screenID: 1, visibleWindows: [a, b]))
+        store.setSlots([LayoutSlot(windowID: a.windowID, start: 0, end: 6)], in: first)
+        let reused = WindowIdentity(windowID: a.windowID, ownerPID: 999)
+        let current = try active(store.observe(screenID: 1, visibleWindows: [reused, c, d]))
+        XCTAssertNotEqual(current.key.groupID, first.key.groupID)
+        XCTAssertTrue(store.slots(in: current).isEmpty)
+    }
+
     func testGroupsOnSameScreenKeepIndependentSlots() throws {
         var store = StageGroupStore<Int>(requiredStableSamples: 1)
         let first = try active(store.observe(screenID: 1, visibleWindows: [a, b]))

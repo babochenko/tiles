@@ -180,6 +180,22 @@ public struct StageGroupStore<ScreenID: Hashable> {
 
     private func matchingKey(screenID: ScreenID, signature: Set<WindowIdentity>) -> StageGroupKey<ScreenID>? {
         let localRecords = records.values.filter { $0.key.screenID == screenID }
+        if let exactLayout = localRecords.first(where: { $0.signature == signature && !$0.slots.isEmpty }) {
+            return exactLayout.key
+        }
+
+        // Unmanaged windows can appear or disappear while a Stage Manager
+        // group is hidden. If every window participating in exactly one stored
+        // layout is visible again, that layout is a stronger and safer signal
+        // than whole-group signature similarity.
+        let layoutMatches = localRecords.filter { record in
+            let slottedWindowIDs = Set(record.slots.map(\.windowID))
+            let slottedIdentities = Set(record.signature.filter { slottedWindowIDs.contains($0.windowID) })
+            return !slottedWindowIDs.isEmpty &&
+                slottedIdentities.count == slottedWindowIDs.count &&
+                slottedIdentities.isSubset(of: signature)
+        }
+        if layoutMatches.count == 1 { return layoutMatches[0].key }
         if let exact = localRecords.first(where: { $0.signature == signature }) { return exact.key }
 
         let matches = localRecords.compactMap { record -> (StageGroupKey<ScreenID>, Double)? in

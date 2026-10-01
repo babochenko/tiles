@@ -21,6 +21,7 @@
 
 - macOS has no public Stage Manager group identifier. Tiles approximates a group from the set of currently visible standard windows on each physical display.
 - A window identity is `(CGWindowID, owner PID)`. Group observations require two stable samples. Exact signatures are restored directly; otherwise a unique Jaccard match of at least 0.5 is reused.
+- If unmanaged windows changed while a group was hidden, a unique stored layout is restored when all of its slotted window IDs are visible again. Never restore from only a partial slotted-window match.
 - Layout slots are stored independently per synthetic Stage Manager group and display for the lifetime of the Tiles process. They are not persisted across app restarts.
 - All previews, snapping, palette actions, auto-tiling, linked resizing, divider interactions, and AX frame writes must remain scoped to a current `StageGroupContext`.
 - `setFrame(_:for:in:)` is the final safety gate: it rejects stale contexts and windows not in the current visible group. Do not bypass it for normal layout operations.
