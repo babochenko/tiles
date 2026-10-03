@@ -10,6 +10,12 @@ private let axWindowNumberAttribute = "AXWindowNumber"
 private let axMinimumSizeAttribute = "AXMinSize"
 private typealias DisplayID = UInt32
 
+fileprivate enum SuspensionReason: Hashable {
+    case systemSleep
+    case screenSleep
+    case lockedSession
+}
+
 private struct VisibleRuntimeWindow {
     let identity: WindowIdentity
     let frame: CGRect
@@ -65,6 +71,8 @@ final class WindowManager {
     private var lastZoomCheck = Date.distantPast
     private var pendingSnap = false
     private var snapDragGesture = SnapDragGesture()
+    private var suspensionReasons: Set<SuspensionReason> = []
+    private var resumeScanningAfter = Date.distantPast
 
     func start() {
         requestAccessibility()
@@ -87,6 +95,33 @@ final class WindowManager {
 
     deinit {
         if let mouseEventMonitor { NSEvent.removeMonitor(mouseEventMonitor) }
+    }
+
+    fileprivate func suspend(for reason: SuspensionReason) {
+        let wasActive = suspensionReasons.isEmpty
+        suspensionReasons.insert(reason)
+        guard wasActive else { return }
+        stageGroups.deactivateAll()
+        closeSnapOverlays()
+        overlay?.close(); overlay = nil
+        zoomPalette?.close(); zoomPalette = nil; zoomPaletteWindowID = nil
+        boundaryDrag = nil
+        boundarySettlePending = false
+        pendingSnap = false
+        draggedWindow = nil
+        resolvedDraggedWindowAfterMovement = false
+        snapDragGesture.reset()
+        if cursorIsResizing { NSCursor.arrow.set(); cursorIsResizing = false }
+    }
+
+    fileprivate func resume(from reason: SuspensionReason) {
+        suspensionReasons.remove(reason)
+        guard suspensionReasons.isEmpty else { return }
+        // WindowServer and Stage Manager briefly publish incomplete snapshots
+        // after wake/unlock. Ignore that interval, then require normal stable
+        // samples before reactivating a stored group.
+        resumeScanningAfter = Date().addingTimeInterval(0.75)
+        lastZoomCheck = .distantPast
     }
 
     func tileFocusedWindow(start: Int, end: Int) {
@@ -200,6 +235,7 @@ final class WindowManager {
     }
 
     private func reconcileAndShowBoundary() {
+        guard suspensionReasons.isEmpty, Date() >= resumeScanningAfter else { return }
         // Boundary dragging is the latency-sensitive path. Avoid AX reads,
         // CGWindow scans, and overlay work after writing both window frames.
         guard boundaryDrag == nil, !boundarySettlePending else { return }
@@ -234,6 +270,7 @@ final class WindowManager {
     }
 
     private func handleMouseEvent(_ type: NSEvent.EventType, at point: CGPoint) {
+        guard suspensionReasons.isEmpty, Date() >= resumeScanningAfter else { return }
         switch type {
         case .leftMouseDown:
             let inTilesWindow = NSApp.windows.contains {
@@ -603,6 +640,7 @@ final class WindowManager {
     }
 
     private func refreshVisibleGroups() {
+        guard suspensionReasons.isEmpty, Date() >= resumeScanningAfter else { return }
         let screens = NSScreen.screens
         let displayHeight = screens.first?.frame.maxY ?? 0
         let ownPID = ProcessInfo.processInfo.processIdentifier
@@ -611,6 +649,7 @@ final class WindowManager {
         ) as? [[String: Any]] ?? []
         var scanned: [WindowIdentity: VisibleRuntimeWindow] = [:]
         var order: [WindowIdentity] = []
+        var remappedPreviousIdentities: Set<WindowIdentity> = []
 
         for info in windowInfo {
             guard (info[kCGWindowLayer as String] as? NSNumber)?.intValue == 0,
@@ -631,6 +670,9 @@ final class WindowManager {
             let windowID = CGWindowID(number.uint32Value)
             guard let element = visibleWindowElement(for: windowID, pid: pid, expectedFrame: frame) else { continue }
             let identity = WindowIdentity(windowID: windowID, ownerPID: pid)
+            remapPreviousIdentityIfNeeded(
+                to: identity, element: element, alreadyRemapped: &remappedPreviousIdentities
+            )
             let record = VisibleRuntimeWindow(
                 identity: identity, frame: frame, element: element, screenID: displayID(for: screens[screenIndex])
             )
@@ -655,6 +697,9 @@ final class WindowManager {
                 windowFrame: frame, screenFrame: screens[screenIndex].frame
             ) {
                 let identity = WindowIdentity(windowID: focused.id, ownerPID: app.processIdentifier)
+                remapPreviousIdentityIfNeeded(
+                    to: identity, element: focused.element, alreadyRemapped: &remappedPreviousIdentities
+                )
                 scanned[identity] = VisibleRuntimeWindow(
                     identity: identity,
                     frame: frame,
@@ -685,6 +730,26 @@ final class WindowManager {
                 if boundaryDrag?.context.key.screenID == screenID { boundaryDrag = nil }
             }
         }
+    }
+
+    private func remapPreviousIdentityIfNeeded(
+        to identity: WindowIdentity,
+        element: AXUIElement,
+        alreadyRemapped: inout Set<WindowIdentity>
+    ) {
+        guard visibleWindows[identity] == nil else { return }
+        let matches = visibleWindows.values.filter {
+            $0.identity.ownerPID == identity.ownerPID &&
+                !alreadyRemapped.contains($0.identity) &&
+                CFEqual($0.element, element)
+        }
+        guard matches.count == 1, let old = matches.first, old.identity != identity else { return }
+        alreadyRemapped.insert(old.identity)
+        stageGroups.remapWindowIdentity(from: old.identity, to: identity)
+        if let oldExpected = expected.removeValue(forKey: old.identity.windowID) {
+            expected[identity.windowID] = oldExpected
+        }
+        elements.removeValue(forKey: old.identity.windowID)
     }
 
     private func closeSnapOverlays() {
@@ -800,7 +865,8 @@ final class WindowManager {
         for id: CGWindowID,
         in context: StageGroupContext<DisplayID>
     ) -> Bool {
-        guard stageGroups.isCurrent(context), let identity = identity(for: id),
+        guard suspensionReasons.isEmpty, Date() >= resumeScanningAfter,
+              stageGroups.isCurrent(context), let identity = identity(for: id),
               stageGroups.permits(window: identity, in: context), visibleWindows[identity] != nil else { return false }
         return setFrameUnchecked(frame, for: id)
     }
@@ -1098,6 +1164,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem?
     private var launchAtStartupItem: NSMenuItem?
     func applicationDidFinishLaunching(_ notification: Notification) {
+        let workspaceNotifications = NSWorkspace.shared.notificationCenter
+        workspaceNotifications.addObserver(
+            self, selector: #selector(systemWillSleep), name: NSWorkspace.willSleepNotification, object: nil
+        )
+        workspaceNotifications.addObserver(
+            self, selector: #selector(systemDidWake), name: NSWorkspace.didWakeNotification, object: nil
+        )
+        workspaceNotifications.addObserver(
+            self, selector: #selector(screensDidSleep), name: NSWorkspace.screensDidSleepNotification, object: nil
+        )
+        workspaceNotifications.addObserver(
+            self, selector: #selector(screensDidWake), name: NSWorkspace.screensDidWakeNotification, object: nil
+        )
+        workspaceNotifications.addObserver(
+            self, selector: #selector(sessionDidResignActive),
+            name: NSWorkspace.sessionDidResignActiveNotification, object: nil
+        )
+        workspaceNotifications.addObserver(
+            self, selector: #selector(sessionDidBecomeActive),
+            name: NSWorkspace.sessionDidBecomeActiveNotification, object: nil
+        )
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         statusItem = item
         item.button?.title = "▦"
@@ -1130,6 +1217,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         updateLaunchAtStartupItem()
         manager.start()
     }
+    @objc private func systemWillSleep() { manager.suspend(for: .systemSleep) }
+    @objc private func systemDidWake() { manager.resume(from: .systemSleep) }
+    @objc private func screensDidSleep() { manager.suspend(for: .screenSleep) }
+    @objc private func screensDidWake() { manager.resume(from: .screenSleep) }
+    @objc private func sessionDidResignActive() { manager.suspend(for: .lockedSession) }
+    @objc private func sessionDidBecomeActive() { manager.resume(from: .lockedSession) }
     func menuWillOpen(_ menu: NSMenu) { updateLaunchAtStartupItem() }
     @objc private func tileFromMenu(_ sender: NSMenuItem) {
         manager.tileFocusedWindow(start: sender.tag / 10, end: sender.tag % 10)

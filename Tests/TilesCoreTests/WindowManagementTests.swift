@@ -222,6 +222,38 @@ final class StageGroupStoreTests: XCTestCase {
         XCTAssertEqual(store.storedGroupCount, 1)
     }
 
+    func testDeactivationPreservesGroupAndRequiresFreshStableSamples() throws {
+        var store = StageGroupStore<Int>()
+        XCTAssertEqual(store.observe(screenID: 1, visibleWindows: [a, b]), .transitioning)
+        let original = try active(store.observe(screenID: 1, visibleWindows: [a, b]))
+        store.setSlots([LayoutSlot(windowID: a.windowID, start: 0, end: 6)], in: original)
+
+        store.deactivateAll()
+
+        XCTAssertFalse(store.isCurrent(original))
+        XCTAssertEqual(store.observe(screenID: 1, visibleWindows: [a, b]), .transitioning)
+        let restored = try active(store.observe(screenID: 1, visibleWindows: [a, b]))
+        XCTAssertEqual(restored.key.groupID, original.key.groupID)
+        XCTAssertEqual(store.slots(in: restored).map(\.windowID), [a.windowID])
+    }
+
+    func testRemappingRecreatedWindowIdentityPreservesLayout() throws {
+        var store = StageGroupStore<Int>(requiredStableSamples: 1)
+        let original = try active(store.observe(screenID: 1, visibleWindows: [a, b]))
+        store.setSlots([
+            LayoutSlot(windowID: a.windowID, start: 0, end: 3),
+            LayoutSlot(windowID: b.windowID, start: 3, end: 6)
+        ], in: original)
+        let recreated = WindowIdentity(windowID: 99, ownerPID: a.ownerPID)
+
+        store.deactivateAll()
+        store.remapWindowIdentity(from: a, to: recreated)
+        let restored = try active(store.observe(screenID: 1, visibleWindows: [recreated, b]))
+
+        XCTAssertEqual(restored.key.groupID, original.key.groupID)
+        XCTAssertEqual(store.slots(in: restored).map(\.windowID), [recreated.windowID, b.windowID])
+    }
+
     private func active(_ observation: StageGroupObservation<Int>) throws -> StageGroupContext<Int> {
         guard case let .active(context) = observation else {
             throw NSError(domain: "StageGroupStoreTests", code: 1)

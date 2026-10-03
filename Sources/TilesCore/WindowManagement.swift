@@ -176,6 +176,42 @@ public struct StageGroupStore<ScreenID: Hashable> {
         isCurrent(context) && context.visibleWindows.contains(window)
     }
 
+    public mutating func deactivateAll() {
+        guard !activeContexts.isEmpty || !pending.isEmpty else { return }
+        activeContexts.removeAll()
+        pending.removeAll()
+        generation += 1
+    }
+
+    public mutating func remapWindowIdentity(from old: WindowIdentity, to new: WindowIdentity) {
+        guard old != new else { return }
+        for key in Array(records.keys) {
+            guard var record = records[key], record.signature.contains(old) else { continue }
+            record.signature.remove(old)
+            record.signature.insert(new)
+            record.slots = record.slots.map {
+                guard $0.windowID == old.windowID else { return $0 }
+                return LayoutSlot(windowID: new.windowID, start: $0.start, end: $0.end)
+            }
+            records[key] = record
+        }
+        for screenID in Array(activeContexts.keys) {
+            guard let context = activeContexts[screenID], context.visibleWindows.contains(old) else { continue }
+            var visible = context.visibleWindows
+            visible.remove(old)
+            visible.insert(new)
+            activeContexts[screenID] = StageGroupContext(
+                key: context.key, visibleWindows: visible, generation: context.generation
+            )
+        }
+        for screenID in Array(pending.keys) {
+            guard var candidate = pending[screenID], candidate.signature.contains(old) else { continue }
+            candidate.signature.remove(old)
+            candidate.signature.insert(new)
+            pending[screenID] = candidate
+        }
+    }
+
     public var storedGroupCount: Int { records.count }
 
     private func matchingKey(screenID: ScreenID, signature: Set<WindowIdentity>) -> StageGroupKey<ScreenID>? {
