@@ -329,11 +329,38 @@ final class WindowManager {
             pendingSnap = false
             snapDragGesture.reset()
         } else {
+            guard isTitleBarDragStart(at: point) else {
+                pendingSnap = false
+                draggedWindow = nil
+                resolvedDraggedWindowAfterMovement = false
+                snapDragGesture.reset()
+                return
+            }
             pendingSnap = true
             snapDragGesture.mouseDown(at: point)
             draggedWindow = focusedWindow()
             resolvedDraggedWindowAfterMovement = false
         }
+    }
+
+    private func isTitleBarDragStart(at point: CGPoint) -> Bool {
+        let displayHeight = NSScreen.screens.first?.frame.maxY ?? 0
+        let ownPID = ProcessInfo.processInfo.processIdentifier
+        let windowInfo = CGWindowListCopyWindowInfo(
+            [.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID
+        ) as? [[String: Any]] ?? []
+        for info in windowInfo {
+            guard (info[kCGWindowLayer as String] as? NSNumber)?.intValue == 0,
+                  (info[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value != ownPID,
+                  ((info[kCGWindowAlpha as String] as? NSNumber)?.doubleValue ?? 1) > 0,
+                  let bounds = info[kCGWindowBounds as String] as? NSDictionary else { continue }
+            var quartzFrame = CGRect.zero
+            guard CGRectMakeWithDictionaryRepresentation(bounds, &quartzFrame) else { continue }
+            let frame = CoordinateGeometry.flipVertically(quartzFrame, displayHeight: displayHeight)
+            guard frame.contains(point) else { continue }
+            return TilingGeometry.isTitleBarDragStart(at: point, windowFrame: frame)
+        }
+        return false
     }
 
     fileprivate func mouseDragged(at point: CGPoint) {

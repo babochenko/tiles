@@ -3,6 +3,16 @@ import XCTest
 @testable import TilesCore
 
 final class TilingGeometryTests: XCTestCase {
+    func testSnapDragMustStartInWindowTitleBar() {
+        let frame = CGRect(x: 100, y: 200, width: 600, height: 500)
+
+        XCTAssertTrue(TilingGeometry.isTitleBarDragStart(at: CGPoint(x: 400, y: 680), windowFrame: frame))
+        XCTAssertTrue(TilingGeometry.isTitleBarDragStart(at: CGPoint(x: 400, y: 660), windowFrame: frame))
+        XCTAssertFalse(TilingGeometry.isTitleBarDragStart(at: CGPoint(x: 400, y: 659), windowFrame: frame))
+        XCTAssertFalse(TilingGeometry.isTitleBarDragStart(at: CGPoint(x: 400, y: 400), windowFrame: frame))
+        XCTAssertFalse(TilingGeometry.isTitleBarDragStart(at: CGPoint(x: 99, y: 680), windowFrame: frame))
+    }
+
     private let screen = CGRect(x: 0, y: 0, width: 1200, height: 900)
 
     func testLeftZoneSkipsStageManagerStripAndUsesBottomCorner() {

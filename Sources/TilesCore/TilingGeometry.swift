@@ -48,6 +48,7 @@ public enum TilingGeometry {
     public static let insertionHitDistance: CGFloat = 30
     public static let insertionIndicatorWidth: CGFloat = 8
     public static let replacementTargetFraction: CGFloat = 0.25
+    public static let titleBarDragHeight: CGFloat = 40
 
     public static func snapZone(at point: CGPoint, in screen: CGRect) -> SnapZone? {
         if abs(point.y - screen.maxY) < topSnapDistance { return .top }
@@ -71,6 +72,15 @@ public enum TilingGeometry {
     ) -> Bool {
         point.x < screenVisibleFrame.minX + leftStageManagerInset ||
             point.y >= screenVisibleFrame.maxY || overInteractiveTilesWindow
+    }
+
+    public static func isTitleBarDragStart(
+        at point: CGPoint,
+        windowFrame: CGRect,
+        titleBarHeight: CGFloat = titleBarDragHeight
+    ) -> Bool {
+        guard windowFrame.contains(point), titleBarHeight > 0 else { return false }
+        return point.y >= windowFrame.maxY - min(titleBarHeight, windowFrame.height)
     }
 
     public static func isCenteredInStageManagerStrip(windowFrame: CGRect, screenFrame: CGRect) -> Bool {

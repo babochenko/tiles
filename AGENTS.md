@@ -12,6 +12,7 @@
 - The right snap target is the rightmost 60 points below the top target.
 - The left snap target intentionally avoids the Stage Manager strip. It is a 240×240-point square at the bottom, starting 140 points from the physical left edge. Do not assume the entire left edge is a snap target.
 - Starting a mouse sequence inside the leftmost 140 points is intentionally ignored to avoid intercepting Stage Manager interactions.
+- Window snapping begins only when the initial mouse-down is within the top 40 points of the frontmost standard window. Drags that begin in the window body do not preview or snap; divider dragging remains available across the divider's normal hit area.
 - Dropping a third window between two tiled windows is supported. The insertion target is within 30 points of their divider, gives haptic feedback, shows an 8-point vertical strip rather than a region preview, inserts the dragged window in the middle, and redistributes all three windows into thirds.
 - Existing tiled windows can be reordered through insertion boundaries. External insertion into an already full three-window layout is intentionally not offered.
 - Dragging an unmanaged window over the top quarter of an existing tiled window offers replacement. It gives haptic feedback, highlights the target's exact frame, assigns that exact slot to the dragged window, and minimizes the displaced window. Insertion strips and physical screen-edge targets take priority over replacement targets.
